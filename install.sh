@@ -6,7 +6,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-"${HOME}/.config"}/agent-learning-system"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
 CODEX_HOME="${CODEX_HOME:-"${HOME}/.codex"}"
 DEFAULT_VAULT="${HOME}/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault"
-DEFAULT_EMAIL="${USER}@marcomc.com"
+DEFAULT_EMAIL="user@example.com"
 VAULT_PATH=""
 OBSIDIAN_PROVIDER="direct"
 EMAIL="${DEFAULT_EMAIL}"
@@ -304,6 +304,8 @@ write_automation() {
 }
 
 install_automations() {
+  local global_agents_file
+  local markdownlint_config
   local midnight_prompt
   local morning_prompt
   local noon_prompt
@@ -313,8 +315,11 @@ install_automations() {
     return 0
   fi
 
-  midnight_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the consolidate-agent-learnings skill. Process new Obsidian notes from inbox and reviewed notes from needs-review. Promote only safe, grounded, reusable lessons into /Users/mmassari/AGENTS.md, the smallest relevant reusable skill, the touched project AGENTS.md, and the existing agent-template mining workflow when useful. Move processed notes to processed/YYYY/MM or needs-review as appropriate, write a report, validate changed Markdown with /Users/mmassari/.markdownlint.json, validate changed shell scripts with shellcheck --enable=all, and do not commit or push."
-  morning_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Check the configured Obsidian AI Agent Learnings/needs-review directory. If there are no pending or ambiguous review notes, do nothing and do not send email. If there are pending or ambiguous review notes, send one concise email to the configured recipient with count, note paths, project paths, and review reasons. Prefer the Gmail connector if available. If Gmail is unavailable, use python3 scripts/agent_learning.py notify --send-msmtp as the msmtp fallback. Do not modify learning notes from this automation."
+  global_agents_file="${HOME}/AGENTS.md"
+  markdownlint_config="${HOME}/.markdownlint.json"
+
+  midnight_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the consolidate-agent-learnings skill. Process new Obsidian notes from inbox and reviewed notes from needs-review. Promote only safe, grounded, reusable lessons into ${global_agents_file}, the smallest relevant reusable skill, the touched project AGENTS.md, and the existing agent-template mining workflow when useful. Move processed notes to processed/YYYY/MM or needs-review as appropriate, write a report, validate changed Markdown with ${markdownlint_config}, validate changed shell scripts with shellcheck --enable=all, and do not commit or push."
+  morning_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Check the configured Obsidian AI Agent Learnings/needs-review directory. If there are no pending or ambiguous review notes, do nothing and do not send email. If the configured recipient is empty or still uses an example.com, example.org, example.net, or example.test placeholder, do not send email; report that ./install.sh --email ADDRESS must be run first. If there are pending or ambiguous review notes and the recipient is configured, send one concise email with count, note paths, project paths, and review reasons. Prefer the Gmail connector if available. If Gmail is unavailable, use python3 scripts/agent_learning.py notify --send-msmtp as the msmtp fallback. Do not modify learning notes from this automation."
   noon_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the consolidate-agent-learnings skill. Process new inbox notes and automatically reprocess needs-review notes where exactly one Review Decision checkbox is selected. Leave unchecked or ambiguous notes pending. Do not reread processed history except for a specific duplicate or conflict. Promote only safe, grounded, reusable lessons into bounded targets, write a report, validate changed Markdown and shell files, and do not commit or push."
 
   write_automation \
@@ -357,6 +362,9 @@ if [[ "${EMAIL_PROVIDER}" == "gmail" ]]; then
   printf '%s\n' "Email provider is Gmail connector. If unavailable, configure msmtp and rerun with --email-provider msmtp."
 elif ! command -v msmtp >/dev/null 2>&1; then
   printf '%s\n' "msmtp is not installed; install/configure it before enabling local email fallback."
+fi
+if [[ "${EMAIL}" == "${DEFAULT_EMAIL}" ]]; then
+  printf '%s\n' "Review email is a placeholder; rerun with --email ADDRESS before relying on morning notifications."
 fi
 
 printf 'Installed Agent Learning System using config %s\n' "${CONFIG_FILE}"

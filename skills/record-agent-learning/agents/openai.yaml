@@ -2,4 +2,3 @@ interface:
   display_name: "Record Agent Learning"
   short_description: "Save reusable session learnings into Obsidian"
   default_prompt: "Use $record-agent-learning to capture the reusable finding or fix from this session."
-

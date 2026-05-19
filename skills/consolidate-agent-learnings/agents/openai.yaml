@@ -2,4 +2,3 @@ interface:
   display_name: "Consolidate Agent Learnings"
   short_description: "Promote reviewed Obsidian learnings into agent guidance"
   default_prompt: "Use $consolidate-agent-learnings to process the agent-learning inbox and reviewed notes."
-

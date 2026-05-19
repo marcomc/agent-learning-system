@@ -34,6 +34,10 @@ EMAIL_PATTERN = (
     r"(?!example\.(?:com|org|net|test)\b)"
     r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 )
+PLACEHOLDER_EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9._%+-]+@example\.(?:com|org|net|test)$",
+    re.IGNORECASE,
+)
 SECRET_ASSIGNMENT_PATTERN = (
     "(?i)" + r"\b(?:token|secret|password|cookie|api[_-]?key)\b\s*[:=]"
 )
@@ -420,6 +424,10 @@ def send_msmtp(recipient: str, subject: str, body: str) -> None:
     subprocess.run(["msmtp", "--read-envelope-from", "-t"], input=message, text=True, check=True)
 
 
+def is_placeholder_email(value: str) -> bool:
+    return bool(PLACEHOLDER_EMAIL_PATTERN.match(value.strip()))
+
+
 def command_notify(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
@@ -431,8 +439,8 @@ def command_notify(args: argparse.Namespace) -> int:
     subject, body = payload
     if args.send_msmtp:
         recipient = config.get("AGENT_LEARNING_EMAIL", "").strip()
-        if not recipient:
-            raise SystemExit("Missing AGENT_LEARNING_EMAIL for msmtp notification.")
+        if not recipient or is_placeholder_email(recipient):
+            raise SystemExit("AGENT_LEARNING_EMAIL is not configured for sending.")
         send_msmtp(recipient, subject, body)
         print(f"SENT {recipient}")
         return 0

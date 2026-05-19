@@ -192,6 +192,32 @@ status: "needs-review"
             self.assertTrue(note.exists())
             self.assertFalse((root / "needs-review" / "review-2.md").exists())
 
+    def test_notify_refuses_placeholder_email_for_msmtp(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "needs-review" / "review.md"
+            note.write_text(
+                """---
+id: "review"
+status: "needs-review"
+---
+# Review
+
+## Review Decision
+
+<!-- BEGIN AGENT LEARNING REVIEW -->
+- [ ] Approve: promote this rule
+- [ ] Retry: I edited the rule, reprocess it
+- [ ] Reject: do not promote this rule
+<!-- END AGENT LEARNING REVIEW -->
+""",
+                encoding="utf-8",
+            )
+            result = self.run_helper(config, "notify", "--send-msmtp", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("AGENT_LEARNING_EMAIL is not configured", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

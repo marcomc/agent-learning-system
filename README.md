@@ -67,6 +67,10 @@ Pass `--skip-automations` if you only want to install config and skills. If the
 Obsidian provider is `mcp-pending`, automation installation is skipped until
 direct vault access or a working MCP setup is configured.
 
+Pass `--email ADDRESS` before relying on the morning review email. Without it,
+the installer records a reserved example address and the morning notification
+flow will not send mail.
+
 If the default Obsidian vault is not found, the installer asks for a direct
 vault path or records MCP mode as pending. Direct filesystem access is the
 recommended mode for this project because the automation only needs local

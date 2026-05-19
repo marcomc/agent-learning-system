@@ -29,6 +29,7 @@ The system keeps learning lightweight and auditable:
 ```text
 .
 ├── README.md
+├── CHANGELOG.md
 ├── AGENTS.md
 ├── config.example.env
 ├── install.sh
@@ -194,7 +195,7 @@ uses the local `msmtp` fallback through `scripts/agent_learning.py notify`.
 Run:
 
 ```bash
-markdownlint --config ~/.markdownlint.json AGENTS.md README.md skills/**/*.md automations/*.md
+markdownlint --config ~/.markdownlint.json AGENTS.md CHANGELOG.md README.md skills/**/*.md automations/*.md
 shellcheck --enable=all install.sh
 python3 -m py_compile scripts/agent_learning.py tests/test_agent_learning.py
 python3 -m unittest discover -s tests

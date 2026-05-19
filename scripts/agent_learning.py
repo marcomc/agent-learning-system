@@ -18,7 +18,7 @@ from typing import Any
 
 
 DEFAULT_CONFIG = Path.home() / ".config" / "agent-learning-system" / "config.env"
-DEFAULT_LEARNING_DIR = "AI Agent Learnings"
+DEFAULT_LEARNING_STORE_NAME = "AI Agent Learnings"
 REVIEW_BEGIN = "<!-- BEGIN AGENT LEARNING REVIEW -->"
 REVIEW_END = "<!-- END AGENT LEARNING REVIEW -->"
 REVIEW_BLOCK = f"""## Review Decision
@@ -48,6 +48,50 @@ PRIVATE_PATTERNS = [
     re.compile(SECRET_ASSIGNMENT_PATTERN),
 ]
 SOURCE_NOTE_DIRS = ("inbox", "needs-review")
+HOOK_BEGIN = "<!-- BEGIN RECORD AGENT LEARNING HOOK -->"
+HOOK_END = "<!-- END RECORD AGENT LEARNING HOOK -->"
+HOOK_SECTION = f"""## Agent Learning Hook
+
+{HOOK_BEGIN}
+When this review workflow produces a real reusable finding, fix, regression, or
+workflow correction, run `$record-agent-learning` before the final response.
+Pass this skill name as `--source-skill`. Skip capture for clean/no-op reviews
+and one-off repository trivia.
+{HOOK_END}
+"""
+HOOK_EXCLUDED_SKILLS = {"record-agent-learning", "consolidate-agent-learnings"}
+REVIEW_FRONTMATTER_HINTS = (
+    "review",
+    "pre-pr",
+    "branch-qa",
+    "max-findings",
+    "remediation",
+    "regression-check",
+    "sanitizer",
+)
+REVIEW_NAME_HINTS = (
+    "review",
+    "pre-pr",
+    "branch-qa",
+    "max-findings",
+    "remediation",
+    "regression-check",
+    "sanitizer",
+    "security-best-practices",
+)
+REVIEW_DESCRIPTION_PATTERN = re.compile(
+    r"\b(?:review|reviewing)\s+(?:a|an|the|this|branches?|codebase|code|diff|project|pull|pr|issue|comments?)\b"
+    r"|\breview/issue comments\b"
+    r"|\bpr-style qa review\b"
+)
+REVIEW_BODY_HINTS = (
+    "code review",
+    "review finding",
+    "review findings",
+    "pre-pr review",
+    "github codex review",
+    "security review",
+)
 
 
 class ConfigError(RuntimeError):
@@ -84,9 +128,15 @@ def require_config(config: dict[str, str], key: str) -> str:
 
 
 def learning_root(config: dict[str, str]) -> Path:
-    vault = Path(require_config(config, "AGENT_LEARNING_VAULT")).expanduser()
-    dirname = config.get("AGENT_LEARNING_DIR", DEFAULT_LEARNING_DIR).strip() or DEFAULT_LEARNING_DIR
-    return vault / dirname
+    legacy_vault = config.get("AGENT_LEARNING_VAULT", "").strip()
+    if legacy_vault:
+        base_dir = Path(legacy_vault).expanduser()
+        store_name = config.get("AGENT_LEARNING_STORE_NAME") or config.get("AGENT_LEARNING_DIR")
+    else:
+        base_dir = Path(require_config(config, "AGENT_LEARNING_DIR")).expanduser()
+        store_name = config.get("AGENT_LEARNING_STORE_NAME")
+    dirname = (store_name or DEFAULT_LEARNING_STORE_NAME).strip() or DEFAULT_LEARNING_STORE_NAME
+    return base_dir / dirname
 
 
 def ensure_store(root: Path) -> None:
@@ -461,6 +511,134 @@ def command_privacy_scan(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def hook_review_score(path: Path, text: str) -> tuple[int, list[str]]:
+    fm, body = parse_frontmatter(text)
+    name = (fm.get("name") or path.parent.name).strip()
+    description = fm.get("description", "")
+    if name in HOOK_EXCLUDED_SKILLS:
+        return 0, ["excluded"]
+
+    frontmatter = f"{name}\n{description}".lower()
+    name_text = name.lower()
+    description_text = description.lower()
+    body_sample = body[:4000].lower()
+    score = 0
+    reasons: list[str] = []
+
+    for hint in REVIEW_NAME_HINTS:
+        if hint in name_text:
+            score += 4
+            reasons.append(f"name mentions {hint}")
+            break
+    if REVIEW_DESCRIPTION_PATTERN.search(description_text):
+        score += 4
+        reasons.append("description frames review as primary")
+    for hint in REVIEW_FRONTMATTER_HINTS:
+        if hint in frontmatter and hint != "review":
+            score += 3
+            reasons.append(f"frontmatter mentions {hint}")
+            break
+    if name_text == "security-best-practices" and any(hint in body_sample for hint in REVIEW_BODY_HINTS):
+        score += 3
+        reasons.append("security best-practices review workflow")
+    elif any(hint in body_sample for hint in REVIEW_BODY_HINTS):
+        score += 1
+        reasons.append("body mentions review workflow")
+
+    return score, reasons
+
+
+def is_review_skill(path: Path, text: str) -> tuple[bool, str]:
+    score, reasons = hook_review_score(path, text)
+    return score >= 3, "; ".join(reasons)
+
+
+def append_hook_section(text: str) -> tuple[str, bool]:
+    if HOOK_BEGIN in text and HOOK_END in text:
+        return text, False
+    return text.rstrip() + "\n\n" + HOOK_SECTION, True
+
+
+def iter_skill_files(roots: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for root in roots:
+        expanded = root.expanduser()
+        if not expanded.exists():
+            continue
+        for path in sorted(expanded.glob("*/SKILL.md")):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            files.append(path)
+    return files
+
+
+def matching_repo_skill_paths(name: str, roots: list[Path]) -> list[Path]:
+    paths: list[Path] = []
+    for root in roots:
+        candidate = root.expanduser() / name / "SKILL.md"
+        if candidate.exists():
+            paths.append(candidate)
+    return paths
+
+
+def write_hook(path: Path, apply: bool) -> tuple[str, bool]:
+    text = path.read_text(encoding="utf-8")
+    updated, changed = append_hook_section(text)
+    if changed and apply:
+        path.write_text(updated, encoding="utf-8")
+    if changed:
+        return ("hooked" if apply else "would-hook"), changed
+    return "already-hooked", changed
+
+
+def command_hook_review_skills(args: argparse.Namespace) -> int:
+    roots = args.skills_dir or [Path.home() / ".agents" / "skills"]
+    repo_roots = args.repo_skills_dir or []
+    actions: list[dict[str, str]] = []
+    for path in iter_skill_files(roots):
+        text = path.read_text(encoding="utf-8")
+        fm, _body = parse_frontmatter(text)
+        name = fm.get("name") or path.parent.name
+        review_skill, reason = is_review_skill(path, text)
+        if not review_skill:
+            continue
+        action, _changed = write_hook(path, args.apply)
+        actions.append(
+            {
+                "action": action,
+                "name": name,
+                "path": str(path),
+                "reason": reason,
+            }
+        )
+        local_resolved = path.resolve()
+        for repo_path in matching_repo_skill_paths(name, repo_roots):
+            if repo_path.resolve() == local_resolved:
+                continue
+            repo_action, _repo_changed = write_hook(repo_path, args.apply)
+            actions.append(
+                {
+                    "action": f"repo-{repo_action}",
+                    "name": name,
+                    "path": str(repo_path),
+                    "reason": "matching repository skill",
+                }
+            )
+
+    if args.json:
+        print(json.dumps({"skills": actions}, indent=2))
+        return 0
+
+    for item in actions:
+        print(f"{item['action'].upper()} {item['name']} {item['path']} [{item['reason']}]")
+    if not actions:
+        print("NO_REVIEW_SKILLS_FOUND")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -506,6 +684,13 @@ def build_parser() -> argparse.ArgumentParser:
     privacy = sub.add_parser("privacy-scan")
     privacy.add_argument("paths", nargs="+")
     privacy.set_defaults(func=command_privacy_scan)
+
+    hook = sub.add_parser("hook-review-skills")
+    hook.add_argument("--skills-dir", type=Path, action="append")
+    hook.add_argument("--repo-skills-dir", type=Path, action="append")
+    hook.add_argument("--apply", action="store_true")
+    hook.add_argument("--json", action="store_true")
+    hook.set_defaults(func=command_hook_review_skills)
     return parser
 
 

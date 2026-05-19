@@ -16,12 +16,20 @@ The project follows semantic versioning.
 - `scripts/agent_learning.py` helper for store initialization, note capture,
   consolidation preparation, note finalization, report writing, notification,
   and privacy scanning.
-- Installer for config generation, Obsidian store initialization, skill
-  installation, Codex skill mirrors, automation records, and local validation.
+- Explicit `record-agent-learning` hook mode for detecting local review skills
+  and adding an idempotent learning-capture hook only when requested.
+- Repository source synchronization for hook mode when installed skills are
+  copied locally instead of symlinked from their source repository.
+- Filesystem-backed learning store configuration where `AGENT_LEARNING_DIR`
+  names the base directory and `AGENT_LEARNING_STORE_NAME` names the generated
+  `AI Agent Learnings` folder.
+- Installer for config generation, learning store initialization, copy-based
+  skill installation, Codex skill mirrors, automation records, and local
+  validation.
 - Codex automation prompt files for midnight consolidation, noon
   consolidation, and morning review email.
 - Unit tests covering note capture, review decisions, finalization, and
   outside-store rejection.
 - README documentation with Mermaid diagrams for install, note lifecycle, and
-  scheduled automation flows.
+  hooked review-skill, and scheduled automation flows.
 - Repository-local agent guidance in `AGENTS.md`.

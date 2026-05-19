@@ -1,16 +1,17 @@
 # Agent Learning System
 
 Local Codex skills and automations for capturing real debugging and review
-learnings, storing them in Obsidian, and promoting reusable lessons into agent
-instructions and review skills.
+learnings, storing them in a filesystem-backed Markdown tree, and promoting
+reusable lessons into agent instructions and review skills.
 
 ## Table of Contents
 
 - [Purpose](#purpose)
 - [Repository Layout](#repository-layout)
 - [Install](#install)
-- [Obsidian Workflow](#obsidian-workflow)
+- [Learning Store](#learning-store)
 - [Skills](#skills)
+- [Review Skill Hooks](#review-skill-hooks)
 - [Automations](#automations)
 - [Validation](#validation)
 
@@ -56,52 +57,69 @@ Run:
 
 The installer:
 
-- detects the active Obsidian vault;
+- detects the active Obsidian vault as a convenient default filesystem path;
 - writes `~/.config/agent-learning-system/config.env`;
-- creates the Obsidian learning folders;
-- installs both skills into `~/.agents/skills` and `~/.codex/skills`;
+- creates the learning store folders;
+- copies both skills into `~/.agents/skills`;
+- links `~/.codex/skills` to the installed `~/.agents/skills` copies;
 - installs or updates the three Codex automations as active;
 - validates Markdown, shell, and Python files.
 
+Pass `--dir PATH` to choose any filesystem directory as the learning-store base.
+The store itself is created as `PATH/AI Agent Learnings/`. If `PATH` is inside
+an Obsidian vault, Obsidian will show the Markdown notes automatically; no
+Obsidian API or MCP server is required.
+
 Pass `--skip-automations` if you only want to install config and skills. If the
 Obsidian provider is `mcp-pending`, automation installation is skipped until
-direct vault access or a working MCP setup is configured.
+direct filesystem access or a working MCP setup is configured.
 
 Pass `--email ADDRESS` before relying on the morning review email. Without it,
 the installer records a reserved example address and the morning notification
 flow will not send mail.
 
 If the default Obsidian vault is not found, the installer asks for a direct
-vault path or records MCP mode as pending. Direct filesystem access is the
-recommended mode for this project because the automation only needs local
-Markdown files.
+filesystem directory path or records MCP mode as pending. Direct filesystem
+access is the recommended mode for this project because the automation only
+needs local Markdown files.
 
 This setup flow follows `install.sh`, including validation, config creation,
-skill installation, Codex mirrors, automation records, and final local checks.
+skill copy installation, Codex mirrors, automation records, and final local
+checks.
 
 ```mermaid
 flowchart LR
   accTitle: Install setup flow
   accDescr: Shows how install.sh resolves config, installs skills, and validates.
-  start["Run install.sh"] --> parse["Parse vault, email, and mode"]
+  start["Run install.sh"] --> parse["Parse directory, email, and mode"]
   parse --> validate["Run Markdown, shell, and Python checks"]
-  validate --> vault{"Vault path known?"}
-  vault -->|Default or --vault| config["Write config.env"]
-  vault -->|Prompt or fallback| pending["Record direct or MCP-pending mode"]
+  validate --> base{"Base directory known?"}
+  base -->|Default or --dir| config["Write config.env"]
+  base -->|Prompt or fallback| pending["Record direct or MCP-pending mode"]
   pending --> config
-  config --> store["Initialize Obsidian store"]
-  store --> install["Install .agents skills"]
+  config --> store["Initialize learning store"]
+  store --> install["Copy .agents skills"]
   install --> mirror["Link .codex skill mirrors"]
   mirror --> automations["Install active Codex automations"]
   automations --> done["Finish install"]
 ```
 
-## Obsidian Workflow
+## Learning Store
 
-The canonical archive lives under the configured vault:
+The canonical archive lives under `AGENT_LEARNING_DIR` plus
+`AGENT_LEARNING_STORE_NAME`.
+
+Example:
+
+```env
+AGENT_LEARNING_DIR="/any/filesystem/folder"
+AGENT_LEARNING_STORE_NAME="AI Agent Learnings"
+```
+
+This creates:
 
 ```text
-AI Agent Learnings/
+/any/filesystem/folder/AI Agent Learnings/
 ├── inbox/
 ├── needs-review/
 ├── processed/YYYY/MM/
@@ -110,8 +128,11 @@ AI Agent Learnings/
     └── processed.json
 ```
 
-This lifecycle follows the `record`, `prepare-run`, `finalize-note`, and
-`write-report` commands in `scripts/agent_learning.py`.
+`AGENT_LEARNING_DIR` may be any local filesystem directory. When it points at an
+Obsidian vault, Obsidian sees the generated Markdown files as normal notes.
+
+> Source: `scripts/agent_learning.py` commands `record`, `prepare-run`,
+> `finalize-note`, and `write-report`.
 
 ```mermaid
 flowchart LR
@@ -154,11 +175,68 @@ conflict.
 Use after a session produces a real reusable finding, fix, regression, or
 workflow correction. It writes one structured note to `inbox/`.
 
+It also has an explicit hook mode for user-requested setup. Hook mode scans the
+local skill directory for review-oriented skills and appends an idempotent
+`Agent Learning Hook` section to each detected target. It does not run during
+ordinary one-off capture.
+
 ### `consolidate-agent-learnings`
 
 Use from scheduled automation or manually when promoting learning notes. It
 classifies new notes, handles reviewed checkbox decisions, promotes strong
 lessons, moves notes, writes reports, and validates changed files.
+
+## Review Skill Hooks
+
+Preview detected review skills:
+
+```bash
+python3 scripts/agent_learning.py hook-review-skills \
+  --skills-dir "${HOME}/.agents/skills"
+```
+
+Install the hook only after explicitly choosing to attach learning capture to
+review skills:
+
+```bash
+python3 scripts/agent_learning.py hook-review-skills \
+  --skills-dir "${HOME}/.agents/skills" \
+  --apply
+```
+
+When a review skill has a separate repository source, also pass that repository
+skill directory:
+
+```bash
+python3 scripts/agent_learning.py hook-review-skills \
+  --skills-dir "${HOME}/.agents/skills" \
+  --repo-skills-dir "/path/to/repository/skills" \
+  --apply
+```
+
+The command detects review skills from their frontmatter and early workflow
+text. It skips `record-agent-learning` and `consolidate-agent-learnings`, avoids
+duplicate hooks, updates the installed local copy, and updates a matching
+repository source when `--repo-skills-dir` is provided.
+
+This hooked-review flow starts only from an explicit hook-mode request and then
+changes future review workflows.
+
+```mermaid
+flowchart LR
+  accTitle: Hooked review skill flow
+  accDescr: Shows how record-agent-learning hooks review skills and captures future lessons.
+  request["User requests hook mode"] --> hook["Run hook-review-skills --apply"]
+  hook --> scan["Scan local skill directory"]
+  scan --> detect{"Review skill detected?"}
+  detect -->|No| skip["Skip skill"]
+  detect -->|Yes| append["Append Agent Learning Hook"]
+  append --> future["Future review skill run"]
+  future --> lesson{"Reusable lesson produced?"}
+  lesson -->|No| no_capture["Skip capture"]
+  lesson -->|Yes| capture["Run record-agent-learning"]
+  capture --> inbox["Write Obsidian inbox note"]
+```
 
 ## Automations
 

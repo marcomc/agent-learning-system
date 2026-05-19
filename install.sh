@@ -5,13 +5,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-"${HOME}/.config"}/agent-learning-system"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
 CODEX_HOME="${CODEX_HOME:-"${HOME}/.codex"}"
-DEFAULT_VAULT="${HOME}/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault"
+DEFAULT_LEARNING_DIR="${HOME}/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault"
 DEFAULT_EMAIL="user@example.com"
-VAULT_PATH=""
+LEARNING_DIR=""
 OBSIDIAN_PROVIDER="direct"
 EMAIL="${DEFAULT_EMAIL}"
 EMAIL_PROVIDER="gmail"
-SKILL_MODE="symlink"
+SKILL_MODE="copy"
 INSTALL_AUTOMATIONS="1"
 MARKDOWN_LIST=""
 
@@ -24,7 +24,7 @@ cleanup() {
 trap cleanup EXIT
 
 usage() {
-  printf '%s\n' "Usage: $0 [--vault PATH] [--email ADDRESS] [--email-provider gmail|msmtp] [--mode symlink|copy] [--skip-automations]"
+  printf '%s\n' "Usage: $0 [--dir PATH] [--vault PATH] [--email ADDRESS] [--email-provider gmail|msmtp] [--skip-automations]"
 }
 
 validate_project() {
@@ -61,8 +61,8 @@ timestamp_ms() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --vault)
-      VAULT_PATH=${2:-}
+    --dir|--vault)
+      LEARNING_DIR=${2:-}
       shift 2
       ;;
     --email)
@@ -71,10 +71,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --email-provider)
       EMAIL_PROVIDER=${2:-}
-      shift 2
-      ;;
-    --mode)
-      SKILL_MODE=${2:-}
       shift 2
       ;;
     --skip-automations)
@@ -93,42 +89,37 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${SKILL_MODE}" != "symlink" && "${SKILL_MODE}" != "copy" ]]; then
-  printf 'Unsupported --mode: %s\n' "${SKILL_MODE}" >&2
-  exit 2
-fi
-
 if [[ "${EMAIL_PROVIDER}" != "gmail" && "${EMAIL_PROVIDER}" != "msmtp" ]]; then
   printf 'Unsupported --email-provider: %s\n' "${EMAIL_PROVIDER}" >&2
   exit 2
 fi
 
-if [[ -z "${VAULT_PATH}" ]]; then
-  if [[ -d "${DEFAULT_VAULT}" ]]; then
-    VAULT_PATH=${DEFAULT_VAULT}
+if [[ -z "${LEARNING_DIR}" ]]; then
+  if [[ -d "${DEFAULT_LEARNING_DIR}" ]]; then
+    LEARNING_DIR=${DEFAULT_LEARNING_DIR}
   elif [[ -t 0 ]]; then
-    printf '%s\n' "Could not find the default Obsidian vault."
+    printf '%s\n' "Could not find the default learning directory."
     printf '%s\n' "Choose an access mode:"
-    printf '%s\n' "1) Direct Obsidian directory path (recommended)"
+    printf '%s\n' "1) Direct filesystem directory path (recommended)"
     printf '%s\n' "2) MCP mode (advanced; automations remain pending until configured)"
     read -r -p "Selection [1]: " selection
     selection=${selection:-1}
     if [[ "${selection}" == "2" ]]; then
       OBSIDIAN_PROVIDER="mcp-pending"
-      VAULT_PATH="${HOME}/Obsidian Vault"
+      LEARNING_DIR="${HOME}/Agent Learning"
       printf '%s\n' "MCP mode recorded as pending. Configure an Obsidian MCP before enabling automations."
     else
-      read -r -p "Obsidian vault path: " VAULT_PATH
+      read -r -p "Learning base directory path: " LEARNING_DIR
       OBSIDIAN_PROVIDER="direct"
     fi
   else
     OBSIDIAN_PROVIDER="mcp-pending"
-    VAULT_PATH="${HOME}/Obsidian Vault"
+    LEARNING_DIR="${HOME}/Agent Learning"
   fi
 fi
 
-if [[ "${OBSIDIAN_PROVIDER}" == "direct" && ! -d "${VAULT_PATH}" ]]; then
-  printf 'Obsidian vault path does not exist: %s\n' "${VAULT_PATH}" >&2
+if [[ "${OBSIDIAN_PROVIDER}" == "direct" && ! -d "${LEARNING_DIR}" ]]; then
+  printf 'Learning base directory path does not exist: %s\n' "${LEARNING_DIR}" >&2
   exit 1
 fi
 
@@ -136,16 +127,16 @@ validate_project
 
 mkdir -p "${CONFIG_DIR}"
 repo_value=$(quote_env "${SCRIPT_DIR}")
-vault_value=$(quote_env "${VAULT_PATH}")
-dir_value=$(quote_env "AI Agent Learnings")
+learning_dir_value=$(quote_env "${LEARNING_DIR}")
+store_name_value=$(quote_env "AI Agent Learnings")
 obsidian_provider_value=$(quote_env "${OBSIDIAN_PROVIDER}")
 email_value=$(quote_env "${EMAIL}")
 email_provider_value=$(quote_env "${EMAIL_PROVIDER}")
 skill_mode_value=$(quote_env "${SKILL_MODE}")
 {
   printf 'AGENT_LEARNING_REPO=%s\n' "${repo_value}"
-  printf 'AGENT_LEARNING_VAULT=%s\n' "${vault_value}"
-  printf 'AGENT_LEARNING_DIR=%s\n' "${dir_value}"
+  printf 'AGENT_LEARNING_DIR=%s\n' "${learning_dir_value}"
+  printf 'AGENT_LEARNING_STORE_NAME=%s\n' "${store_name_value}"
   printf 'AGENT_LEARNING_OBSIDIAN_PROVIDER=%s\n' "${obsidian_provider_value}"
   printf 'AGENT_LEARNING_EMAIL=%s\n' "${email_value}"
   printf 'AGENT_LEARNING_EMAIL_PROVIDER=%s\n' "${email_provider_value}"
@@ -158,30 +149,18 @@ install_path() {
   local source=$1
   local dest=$2
   local backup
-  local existing_target
   local timestamp
 
   mkdir -p "$(dirname -- "${dest}")"
   timestamp=$(date +%Y%m%d%H%M%S)
-  existing_target=""
-  if [[ -L "${dest}" ]]; then
-    existing_target=$(readlink "${dest}")
-  fi
 
   if [[ -e "${dest}" || -L "${dest}" ]]; then
-    if [[ "${SKILL_MODE}" == "symlink" && -L "${dest}" && "${existing_target}" == "${source}" ]]; then
-      return 0
-    fi
     backup="${dest}.backup.${timestamp}"
     mv "${dest}" "${backup}"
     printf 'Backed up existing %s to %s\n' "${dest}" "${backup}"
   fi
 
-  if [[ "${SKILL_MODE}" == "symlink" ]]; then
-    ln -s "${source}" "${dest}"
-  else
-    cp -R "${source}" "${dest}"
-  fi
+  cp -R "${source}" "${dest}"
 }
 
 install_codex_link() {
@@ -319,7 +298,7 @@ install_automations() {
   markdownlint_config="${HOME}/.markdownlint.json"
 
   midnight_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the consolidate-agent-learnings skill. Process new Obsidian notes from inbox and reviewed notes from needs-review. Promote only safe, grounded, reusable lessons into ${global_agents_file}, the smallest relevant reusable skill, the touched project AGENTS.md, and the existing agent-template mining workflow when useful. Move processed notes to processed/YYYY/MM or needs-review as appropriate, write a report, validate changed Markdown with ${markdownlint_config}, validate changed shell scripts with shellcheck --enable=all, and do not commit or push."
-  morning_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Check the configured Obsidian AI Agent Learnings/needs-review directory. If there are no pending or ambiguous review notes, do nothing and do not send email. If the configured recipient is empty or still uses an example.com, example.org, example.net, or example.test placeholder, do not send email; report that ./install.sh --email ADDRESS must be run first. If there are pending or ambiguous review notes and the recipient is configured, send one concise email with count, note paths, project paths, and review reasons. Prefer the Gmail connector if available. If Gmail is unavailable, use python3 scripts/agent_learning.py notify --send-msmtp as the msmtp fallback. Do not modify learning notes from this automation."
+  morning_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Check the configured AI Agent Learnings/needs-review directory. If there are no pending or ambiguous review notes, do nothing and do not send email. If the configured recipient is empty or still uses an example.com, example.org, example.net, or example.test placeholder, do not send email; report that ./install.sh --email ADDRESS must be run first. If there are pending or ambiguous review notes and the recipient is configured, send one concise email with count, note paths, project paths, and review reasons. Prefer the Gmail connector if available. If Gmail is unavailable, use python3 scripts/agent_learning.py notify --send-msmtp as the msmtp fallback. Do not modify learning notes from this automation."
   noon_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the consolidate-agent-learnings skill. Process new inbox notes and automatically reprocess needs-review notes where exactly one Review Decision checkbox is selected. Leave unchecked or ambiguous notes pending. Do not reread processed history except for a specific duplicate or conflict. Promote only safe, grounded, reusable lessons into bounded targets, write a report, validate changed Markdown and shell files, and do not commit or push."
 
   write_automation \

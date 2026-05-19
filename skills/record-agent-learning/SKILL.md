@@ -1,6 +1,6 @@
 ---
 name: record-agent-learning
-description: Capture a real reusable finding, fix, regression, or workflow lesson from the current Codex session into the configured Obsidian agent-learning inbox.
+description: Use when capturing a real reusable finding, fix, regression, or workflow lesson, or when explicitly asked to install the capture hook into local review skills.
 ---
 
 # Record Agent Learning
@@ -8,6 +8,14 @@ description: Capture a real reusable finding, fix, regression, or workflow lesso
 Use this skill near the end of a session when the work produced a reusable
 learning from a real problem. Do not use it for ordinary sessions with no
 finding, fix, regression, workflow correction, or prevention lesson.
+
+Use hook mode only when the user explicitly asks to install, hook, attach, or
+agganciare `record-agent-learning` to review skills. Do not install hooks during
+ordinary one-off learning capture.
+
+This skill's repository copy is the source. `install.sh` installs a copied
+directory under `${HOME}/.agents/skills/record-agent-learning`; do not rely on a
+symlink from the installed skill back to the repository source.
 
 ## Capture Criteria
 
@@ -47,7 +55,56 @@ python3 "${repo}/scripts/agent_learning.py" record \
 
 For complex text, pass JSON with `--from-json <file>` or `--from-json -`.
 
+## Hook Mode
+
+Run this mode only for explicit user requests such as "install the hook",
+"hook review skills", or "aggancia questa skill alle review skill".
+
+Preview the detected review skills:
+
+```bash
+repo="${AGENT_LEARNING_REPO:-/path/to/agent-learning-system}"
+python3 "${repo}/scripts/agent_learning.py" hook-review-skills \
+  --skills-dir "${HOME}/.agents/skills"
+```
+
+Apply the hook after the user explicitly asked for installation:
+
+```bash
+repo="${AGENT_LEARNING_REPO:-/path/to/agent-learning-system}"
+python3 "${repo}/scripts/agent_learning.py" hook-review-skills \
+  --skills-dir "${HOME}/.agents/skills" \
+  --apply
+```
+
+If installed skills are copied from a repository instead of symlinked, pass the
+repository skill directory too so the source copy is updated after the local
+installed copy:
+
+```bash
+repo="${AGENT_LEARNING_REPO:-/path/to/agent-learning-system}"
+python3 "${repo}/scripts/agent_learning.py" hook-review-skills \
+  --skills-dir "${HOME}/.agents/skills" \
+  --repo-skills-dir "/path/to/repository/skills" \
+  --apply
+```
+
+The helper scans local skill frontmatter and early workflow text, identifies
+review-oriented skills, and appends one idempotent `Agent Learning Hook` section
+to each target. The hook tells future review workflows to run
+`$record-agent-learning` only when they produce a real reusable finding, fix,
+regression, or workflow correction.
+
+After changing this skill's repository source, refresh the installed copy with:
+
+```bash
+repo="${AGENT_LEARNING_REPO:-/path/to/agent-learning-system}"
+"${repo}/install.sh" --skip-automations
+```
+
 ## Output
 
-Report the created Obsidian note path. Do not promote rules directly from this
-skill; promotion belongs to `consolidate-agent-learnings`.
+For one-off capture, report the created Obsidian note path. For hook mode,
+report which review skills were hooked or already had the hook. Do not promote
+rules directly from this skill; promotion belongs to
+`consolidate-agent-learnings`.

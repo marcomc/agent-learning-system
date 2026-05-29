@@ -85,6 +85,13 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
 
    Also run `shellcheck --enable=all` for changed shell files.
 
+9. Run a conflict/duplication audit on the promotion targets:
+
+   ```bash
+   repo="/path/to/agent-learning-system"
+   python3 "${repo}/scripts/agent_learning.py" audit-rules
+   ```
+
 ## Report Requirements
 
 Each consolidation report must include:

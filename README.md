@@ -168,6 +168,35 @@ The consolidator reads `inbox/`, `needs-review/`, and `state/processed.json`.
 It does not reread `processed/` history unless resolving a duplicate or
 conflict.
 
+## Conflicts and precedence (visual)
+
+```mermaid
+flowchart LR
+  accTitle: Rule precedence when two rules disagree
+  accDescr: Shows which rule wins when guidance conflicts.
+  g["Global: $HOME/AGENTS.md"] --> p["Project: <repo>/AGENTS.md"]
+  p --> s["Domain skill: $HOME/.agents/skills/*/SKILL.md"]
+  s --> d{"Same scope?"}
+  d -->|No| keep["Keep both; clarify scope"]
+  d -->|Yes| review["Send to needs-review"]
+```
+
+## Conflict detection levels
+
+```mermaid
+flowchart LR
+  accTitle: Where conflicts should be detected
+  accDescr: Promotion-time and periodic audits.
+  capture["Capture note"] --> consolidate["Consolidate/promote"]
+  consolidate --> detect_now["Detect conflicts in touched targets"]
+  detect_now --> ok["Finalize processed"]
+  detect_now --> unsure["Move to needs-review"]
+  consolidate --> detect_daily["Daily audit (cleanup)"]
+  detect_daily --> review2["Open needs-review or fix targets"]
+```
+
+The system currently supports a periodic audit via `audit-rules` (see below).
+
 ## Skills
 
 ### `record-agent-learning`
@@ -185,6 +214,21 @@ ordinary one-off capture.
 Use from scheduled automation or manually when promoting learning notes. It
 classifies new notes, handles reviewed checkbox decisions, promotes strong
 lessons, moves notes, writes reports, and validates changed files.
+
+### `audit-rules`
+
+Scan promoted targets (default: `$HOME/AGENTS.md` and `$HOME/.agents/skills/**`)
+for duplicate or potentially conflicting bullets.
+
+```bash
+python3 scripts/agent_learning.py audit-rules
+```
+
+Limit the scan to a specific directory or file:
+
+```bash
+python3 scripts/agent_learning.py audit-rules --path /path/to/dir-or-file
+```
 
 ## Review Skill Hooks
 

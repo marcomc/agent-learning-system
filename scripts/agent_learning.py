@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -92,6 +93,11 @@ REVIEW_BODY_HINTS = (
     "github codex review",
     "security review",
 )
+
+DEFAULT_AUDIT_SKILLS_DIR = Path.home() / ".agents" / "skills"
+DEFAULT_AUDIT_TARGETS = (Path.home() / "AGENTS.md",)
+DEFAULT_SIMILARITY_THRESHOLD = 0.92
+DEFAULT_CONFLICT_THRESHOLD = 0.78
 
 
 class ConfigError(RuntimeError):
@@ -511,6 +517,139 @@ def command_privacy_scan(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def iter_markdown_bullets(path: Path) -> list[dict[str, Any]]:
+    bullets: list[dict[str, Any]] = []
+    in_fence = False
+    for idx, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+        line = raw.rstrip("\n")
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = re.match(r"^\s*-\s+(.*)$", line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if value.startswith("[ ]") or value.startswith("[x]") or value.startswith("[X]"):
+            continue
+        if not value:
+            continue
+        bullets.append({"path": str(path), "line": idx, "text": value})
+    return bullets
+
+
+def normalize_rule(text: str) -> str:
+    lowered = text.lower().replace("`", "")
+    lowered = re.sub(r"[-_/]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    lowered = re.sub(r"[^a-z0-9 ]+", "", lowered)
+    return lowered
+
+
+def rule_polarity(text: str) -> int:
+    normalized = normalize_rule(text)
+    negative_phrases = ("do not", "dont", "never", "ban", "forbid", "must not", "cannot", "avoid")
+    positive_phrases = ("allow", "permit", "ok to", "acceptable to", "prefer")
+    negative = any(phrase in normalized for phrase in negative_phrases)
+    positive = any(phrase in normalized for phrase in positive_phrases)
+    if negative and not positive:
+        return -1
+    if positive and not negative:
+        return 1
+    return 0
+
+
+def command_audit_rules(args: argparse.Namespace) -> int:
+    paths: list[Path] = []
+    if args.path:
+        paths.extend(Path(p).expanduser() for p in args.path)
+    else:
+        paths.extend(DEFAULT_AUDIT_TARGETS)
+        skills_dir = args.skills_dir.expanduser() if args.skills_dir else DEFAULT_AUDIT_SKILLS_DIR
+        if skills_dir.exists():
+            paths.append(skills_dir)
+
+    markdown_files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            if args.all_md:
+                markdown_files.extend([p for p in path.glob("**/*.md") if p.is_file()])
+            else:
+                markdown_files.extend([p for p in path.glob("**/SKILL.md") if p.is_file()])
+                markdown_files.extend([p for p in path.glob("**/AGENTS.md") if p.is_file()])
+        elif path.is_file() and path.suffix.lower() == ".md":
+            markdown_files.append(path)
+
+    rules: list[dict[str, Any]] = []
+    for md_path in sorted(set(markdown_files)):
+        for bullet in iter_markdown_bullets(md_path):
+            bullet["norm"] = normalize_rule(bullet["text"])
+            rules.append(bullet)
+
+    by_norm: dict[str, list[dict[str, Any]]] = {}
+    for rule in rules:
+        norm = rule["norm"]
+        if len(norm) < 24:
+            continue
+        by_norm.setdefault(norm, []).append(rule)
+
+    exact_duplicates = [group for group in by_norm.values() if len(group) > 1]
+
+    similarity_threshold = float(args.similarity_threshold)
+    conflict_threshold = float(args.conflict_threshold)
+    buckets: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for rule in rules:
+        norm = rule["norm"]
+        if len(norm) < 24:
+            continue
+        first = norm.split(" ", 1)[0] if norm else ""
+        buckets.setdefault((first, len(norm) // 24), []).append(rule)
+
+    near_duplicates: list[dict[str, Any]] = []
+    potential_conflicts: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, int, str, int]] = set()
+
+    for group in buckets.values():
+        if len(group) < 2:
+            continue
+        for idx, left in enumerate(group):
+            for right in group[idx + 1 :]:
+                key = (left["path"], left["line"], right["path"], right["line"])
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                if left["norm"] == right["norm"]:
+                    continue
+                ratio = difflib.SequenceMatcher(None, left["norm"], right["norm"]).ratio()
+                if ratio >= similarity_threshold:
+                    near_duplicates.append({"ratio": ratio, "a": left, "b": right})
+                if ratio >= conflict_threshold:
+                    pol_a = rule_polarity(left["text"])
+                    pol_b = rule_polarity(right["text"])
+                    if pol_a and pol_b and pol_a != pol_b:
+                        potential_conflicts.append({"ratio": ratio, "a": left, "b": right})
+
+    payload = {
+        "scanned_files": [str(path) for path in sorted(set(markdown_files))],
+        "rule_count": len(rules),
+        "exact_duplicates": exact_duplicates,
+        "near_duplicates": sorted(near_duplicates, key=lambda item: item["ratio"], reverse=True),
+        "potential_conflicts": sorted(potential_conflicts, key=lambda item: item["ratio"], reverse=True),
+        "thresholds": {
+            "similarity_threshold": similarity_threshold,
+            "conflict_threshold": conflict_threshold,
+        },
+    }
+
+    try:
+        print(json.dumps(payload, indent=2))
+    except BrokenPipeError:
+        return 0
+    return 0
+
+
 def hook_review_score(path: Path, text: str) -> tuple[int, list[str]]:
     fm, body = parse_frontmatter(text)
     name = (fm.get("name") or path.parent.name).strip()
@@ -684,6 +823,14 @@ def build_parser() -> argparse.ArgumentParser:
     privacy = sub.add_parser("privacy-scan")
     privacy.add_argument("paths", nargs="+")
     privacy.set_defaults(func=command_privacy_scan)
+
+    audit = sub.add_parser("audit-rules")
+    audit.add_argument("--path", action="append")
+    audit.add_argument("--skills-dir", type=Path, default=None)
+    audit.add_argument("--similarity-threshold", default=str(DEFAULT_SIMILARITY_THRESHOLD))
+    audit.add_argument("--conflict-threshold", default=str(DEFAULT_CONFLICT_THRESHOLD))
+    audit.add_argument("--all-md", action="store_true")
+    audit.set_defaults(func=command_audit_rules)
 
     hook = sub.add_parser("hook-review-skills")
     hook.add_argument("--skills-dir", type=Path, action="append")

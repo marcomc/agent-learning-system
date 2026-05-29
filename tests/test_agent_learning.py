@@ -416,6 +416,45 @@ description: Use when reviewing and fixing a branch before PR review.
             text = repository_skill.read_text(encoding="utf-8")
             self.assertEqual(text.count("BEGIN RECORD AGENT LEARNING HOOK"), 1)
 
+    def test_audit_rules_detects_duplicates_and_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            rules_dir = directory / "rules"
+            rules_dir.mkdir()
+            file_a = rules_dir / "a.md"
+            file_b = rules_dir / "b.md"
+            file_a.write_text(
+                "\n".join(
+                    [
+                        "# Rules",
+                        "",
+                        "- Always require a negative-path test when rejecting legacy inputs.",
+                        "- Prefer wrapper commands for common flags.",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            file_b.write_text(
+                "\n".join(
+                    [
+                        "# More rules",
+                        "",
+                        "- Always require a negative path test when rejecting legacy inputs.",
+                        "- Prefer wrapper command for common flags.",
+                        "- Allow wrapper commands to be bypassed without documenting setup steps.",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_helper(config, "audit-rules", "--path", str(rules_dir), "--all-md")
+            payload = json.loads(result.stdout)
+            self.assertGreaterEqual(len(payload["exact_duplicates"]), 1)
+            self.assertGreaterEqual(len(payload["near_duplicates"]), 1)
+            self.assertIsInstance(payload["potential_conflicts"], list)
+
 
 if __name__ == "__main__":
     unittest.main()

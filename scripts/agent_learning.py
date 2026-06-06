@@ -44,8 +44,12 @@ PLACEHOLDER_EMAIL_PATTERN = re.compile(
 SECRET_ASSIGNMENT_PATTERN = (
     "(?i)" + r"\b(?:token|secret|password|cookie|api[_-]?key)\b\s*[:=]"
 )
+LOCAL_PATH_PATTERN = (
+    r"/(?:Users|home)/[A-Za-z0-9._-]+(?:/[^\s`'\"<>)]*)?"
+    r"|/(?:workspace|workspaces)/[A-Za-z0-9._-]+(?:/[^\s`'\"<>)]*)?"
+)
 PRIVATE_PATTERNS = [
-    re.compile("/" + r"Users/[A-Za-z0-9._-]+"),
+    re.compile(LOCAL_PATH_PATTERN),
     re.compile(EMAIL_PATTERN),
     re.compile(r"\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[0-1]))(?:\.\d{1,3}){2,3}\b"),
     re.compile(SECRET_ASSIGNMENT_PATTERN),

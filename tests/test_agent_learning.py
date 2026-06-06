@@ -713,6 +713,43 @@ status: "inbox"
             self.assertEqual(result.returncode, 2)
             self.assertIn("must be scrubbed", result.stderr)
 
+    def test_create_template_draft_rejects_linux_local_candidate_rule(self) -> None:
+        candidate_rules = [
+            "Do not write /home/alice/vault into shared handoffs.",
+            "Do not write /workspace/private-repo into shared handoffs.",
+        ]
+        for candidate_rule in candidate_rules:
+            with self.subTest(candidate_rule=candidate_rule):
+                with tempfile.TemporaryDirectory() as raw:
+                    directory = Path(raw)
+                    config = self.write_config(directory)
+                    template_repo = directory / "templates"
+                    template_repo.mkdir()
+                    (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
+                    result = self.run_helper(
+                        config,
+                        "create-template-draft",
+                        "--template-repo",
+                        str(template_repo),
+                        "--lesson-family",
+                        "private-path",
+                        "--source-note",
+                        "note.md",
+                        "--proposed-template",
+                        "docs",
+                        "--candidate-rule",
+                        candidate_rule,
+                        "--prevention-target",
+                        "atom:docs",
+                        "--privacy-verdict",
+                        "clean",
+                        "--enforce-routing",
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("must be scrubbed", result.stderr)
+                    self.assertFalse((template_repo / ".work").exists())
+
     def test_notify_refuses_placeholder_email_for_msmtp(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config = self.write_config(Path(raw))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -12,6 +13,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "agent_learning.py"
+
+
+def load_agent_learning_module():
+    spec = importlib.util.spec_from_file_location("agent_learning_under_test", SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load agent_learning module for tests.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class AgentLearningTests(unittest.TestCase):
@@ -427,7 +437,7 @@ status: "inbox"
             self.assertEqual(note.read_text(encoding="utf-8"), original)
             self.assertFalse(list((root / "processed").glob("**/*.md")))
 
-    def test_finalize_note_does_not_reclaim_state_lock_by_age(self) -> None:
+    def test_finalize_note_does_not_reclaim_owned_state_lock_by_age(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config = self.write_config(Path(raw))
             root = Path(self.run_helper(config, "init-store").stdout.strip())
@@ -440,7 +450,7 @@ status: "inbox"
 """
             note.write_text(original, encoding="utf-8")
             lock_dir = root / "state" / ".processed.lock"
-            lock_dir.mkdir()
+            lock_dir.write_text(json.dumps({"pid": os.getpid()}) + "\n", encoding="utf-8")
             old_time = time.time() - 3600
             os.utime(lock_dir, (old_time, old_time))
 
@@ -462,6 +472,69 @@ status: "inbox"
             self.assertTrue(lock_dir.exists())
             self.assertEqual(note.read_text(encoding="utf-8"), original)
             self.assertFalse(list((root / "processed").glob("**/*.md")))
+
+    def test_finalize_note_reclaims_old_ownerless_state_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "ownerless.md"
+            note.write_text(
+                """---
+id: "ownerless"
+status: "inbox"
+---
+# Ownerless
+""",
+                encoding="utf-8",
+            )
+            lock_dir = root / "state" / ".processed.lock"
+            lock_dir.mkdir()
+            old_time = time.time() - 3600
+            os.utime(lock_dir, (old_time, old_time))
+
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Ownerless lock recovered.",
+                "--lesson-family",
+                "lock-recovery",
+                "--scope",
+                "project-local",
+                "--prevention-target",
+                "project-local:agent-learning-system",
+                "--routing-rationale",
+                "Project automation preserves queue state.",
+                "--enforce-routing",
+                env={"AGENT_LEARNING_STATE_LOCK_OWNERLESS_GRACE_SECONDS": "0.01"},
+            )
+
+            moved = Path(result.stdout.strip())
+            self.assertTrue(moved.exists())
+            self.assertFalse(lock_dir.exists())
+
+    def test_state_lock_falls_back_when_hard_links_are_unavailable(self) -> None:
+        agent_learning = load_agent_learning_module()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            original_link = agent_learning.os.link
+
+            def fail_link(_source: Path, _dest: Path) -> None:
+                raise OSError("hard links unavailable")
+
+            agent_learning.os.link = fail_link
+            try:
+                with agent_learning.state_update_lock(root):
+                    lock_path = root / "state" / ".processed.lock"
+                    self.assertTrue(lock_path.exists())
+                    self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8"))["pid"], os.getpid())
+                self.assertFalse((root / "state" / ".processed.lock").exists())
+            finally:
+                agent_learning.os.link = original_link
 
     def test_finalize_note_malformed_state_keeps_note_in_queue(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

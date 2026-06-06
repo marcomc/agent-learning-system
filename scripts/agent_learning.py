@@ -454,7 +454,7 @@ def process_is_running(pid: int) -> bool:
 
 
 def reclaim_dead_state_lock(lock_dir: Path) -> bool:
-    owner_path = lock_dir / STATE_LOCK_OWNER_FILE
+    owner_path = lock_dir / STATE_LOCK_OWNER_FILE if lock_dir.is_dir() else lock_dir
     try:
         owner = json.loads(owner_path.read_text(encoding="utf-8"))
         pid = int(owner.get("pid"))
@@ -463,10 +463,28 @@ def reclaim_dead_state_lock(lock_dir: Path) -> bool:
     if process_is_running(pid):
         return False
     try:
-        owner_path.unlink()
-        lock_dir.rmdir()
+        if lock_dir.is_dir():
+            owner_path.unlink()
+            lock_dir.rmdir()
+        else:
+            lock_dir.unlink()
     except OSError:
         return False
+    return True
+
+
+def acquire_state_lock(lock_dir: Path) -> bool:
+    pending_path = lock_dir.with_name(f".{lock_dir.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        pending_path.write_text(json.dumps({"pid": os.getpid()}) + "\n", encoding="utf-8")
+        os.link(pending_path, lock_dir)
+    except FileExistsError:
+        return False
+    finally:
+        try:
+            pending_path.unlink()
+        except FileNotFoundError:
+            pass
     return True
 
 
@@ -477,30 +495,20 @@ def state_update_lock(root: Path):
     deadline = time.monotonic() + STATE_LOCK_TIMEOUT_SECONDS
     acquired = False
     while not acquired:
-        try:
-            lock_dir.mkdir()
-            try:
-                atomic_write_text(lock_dir / STATE_LOCK_OWNER_FILE, json.dumps({"pid": os.getpid()}) + "\n")
-            except Exception:
-                lock_dir.rmdir()
-                raise
+        if acquire_state_lock(lock_dir):
             acquired = True
-        except FileExistsError:
-            if reclaim_dead_state_lock(lock_dir):
-                continue
-            if time.monotonic() >= deadline:
-                raise ConfigError(f"Timed out waiting for state lock: {lock_dir}")
-            time.sleep(0.05)
+            continue
+        if reclaim_dead_state_lock(lock_dir):
+            continue
+        if time.monotonic() >= deadline:
+            raise ConfigError(f"Timed out waiting for state lock: {lock_dir}")
+        time.sleep(0.05)
     try:
         yield
     finally:
         if acquired:
             try:
-                (lock_dir / STATE_LOCK_OWNER_FILE).unlink()
-            except FileNotFoundError:
-                pass
-            try:
-                lock_dir.rmdir()
+                lock_dir.unlink()
             except FileNotFoundError:
                 pass
 

@@ -91,6 +91,7 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
      --proposed-template "docs" \
      --candidate-rule "Run markdownlint before completing Markdown documentation changes." \
      --prevention-target "atom:docs" \
+     --routing-rationale "Documentation agents load the docs atom before editing Markdown." \
      --privacy-verdict clean \
      --enforce-routing
    ```

@@ -115,7 +115,7 @@ ROUTING_SCOPES = (
 TEMPLATE_UPSTREAM_STATUSES = ("not-applicable", "draft-created", "promoted", "deferred")
 RECURRENCE_CHECKS = ("new", "duplicate-before-promotion", "duplicate-after-prevention")
 STATE_LOCK_TIMEOUT_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS", "10.0"))
-STATE_LOCK_STALE_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_STALE_SECONDS", "60.0"))
+STATE_LOCK_OWNER_FILE = "owner.json"
 
 
 class ConfigError(RuntimeError):
@@ -441,6 +441,35 @@ def atomic_write_text(path: Path, text: str) -> None:
             tmp.unlink()
 
 
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def reclaim_dead_state_lock(lock_dir: Path) -> bool:
+    owner_path = lock_dir / STATE_LOCK_OWNER_FILE
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        pid = int(owner.get("pid"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+    if process_is_running(pid):
+        return False
+    try:
+        owner_path.unlink()
+        lock_dir.rmdir()
+    except OSError:
+        return False
+    return True
+
+
 @contextmanager
 def state_update_lock(root: Path):
     lock_dir = root / "state" / ".processed.lock"
@@ -450,14 +479,15 @@ def state_update_lock(root: Path):
     while not acquired:
         try:
             lock_dir.mkdir()
+            try:
+                atomic_write_text(lock_dir / STATE_LOCK_OWNER_FILE, json.dumps({"pid": os.getpid()}) + "\n")
+            except Exception:
+                lock_dir.rmdir()
+                raise
             acquired = True
         except FileExistsError:
-            try:
-                if time.time() - lock_dir.stat().st_mtime > STATE_LOCK_STALE_SECONDS:
-                    lock_dir.rmdir()
-                    continue
-            except OSError:
-                pass
+            if reclaim_dead_state_lock(lock_dir):
+                continue
             if time.monotonic() >= deadline:
                 raise ConfigError(f"Timed out waiting for state lock: {lock_dir}")
             time.sleep(0.05)
@@ -465,6 +495,10 @@ def state_update_lock(root: Path):
         yield
     finally:
         if acquired:
+            try:
+                (lock_dir / STATE_LOCK_OWNER_FILE).unlink()
+            except FileNotFoundError:
+                pass
             try:
                 lock_dir.rmdir()
             except FileNotFoundError:

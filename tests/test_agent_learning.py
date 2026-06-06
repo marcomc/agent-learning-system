@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -423,6 +424,42 @@ status: "inbox"
 
             self.assertEqual(result.returncode, 2)
             self.assertIn("Timed out waiting for state lock", result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+            self.assertFalse(list((root / "processed").glob("**/*.md")))
+
+    def test_finalize_note_does_not_reclaim_state_lock_by_age(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "old-lock.md"
+            original = """---
+id: "old-lock"
+status: "inbox"
+---
+# Old Lock
+"""
+            note.write_text(original, encoding="utf-8")
+            lock_dir = root / "state" / ".processed.lock"
+            lock_dir.mkdir()
+            old_time = time.time() - 3600
+            os.utime(lock_dir, (old_time, old_time))
+
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "State lock is held.",
+                check=False,
+                env={"AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS": "0.05"},
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Timed out waiting for state lock", result.stderr)
+            self.assertTrue(lock_dir.exists())
             self.assertEqual(note.read_text(encoding="utf-8"), original)
             self.assertFalse(list((root / "processed").glob("**/*.md")))
 

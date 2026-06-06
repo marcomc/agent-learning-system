@@ -10,6 +10,9 @@ reusable lessons into agent instructions and review skills.
 - [Repository Layout](#repository-layout)
 - [Install](#install)
 - [Learning Store](#learning-store)
+- [Instruction and Skill Context](#instruction-and-skill-context)
+- [Conflict Detection Levels](#conflict-detection-levels)
+- [Architecture](#architecture)
 - [Skills](#skills)
 - [Review Skill Hooks](#review-skill-hooks)
 - [Automations](#automations)
@@ -38,6 +41,8 @@ The system keeps learning lightweight and auditable:
 │   ├── midnight-consolidation.md
 │   ├── morning-review-email.md
 │   └── noon-consolidation.md
+├── docs/
+│   └── composable-learning-architecture.md
 ├── scripts/
 │   └── agent_learning.py
 ├── skills/
@@ -132,7 +137,8 @@ This creates:
 Obsidian vault, Obsidian sees the generated Markdown files as normal notes.
 
 > Source: `scripts/agent_learning.py` commands `record`, `prepare-run`,
-> `finalize-note`, and `write-report`.
+> `finalize-note`, `write-report`, `summarize-runs`, and
+> `create-template-draft`.
 
 ```mermaid
 flowchart LR
@@ -168,20 +174,27 @@ The consolidator reads `inbox/`, `needs-review/`, and `state/processed.json`.
 It does not reread `processed/` history unless resolving a duplicate or
 conflict.
 
-## Conflicts and precedence (visual)
+## Instruction and Skill Context
 
 ```mermaid
 flowchart LR
-  accTitle: Rule precedence when two rules disagree
-  accDescr: Shows which rule wins when guidance conflicts.
-  g["Global: $HOME/AGENTS.md"] --> p["Project: <repo>/AGENTS.md"]
-  p --> s["Domain skill: $HOME/.agents/skills/*/SKILL.md"]
-  s --> d{"Same scope?"}
-  d -->|No| keep["Keep both; clarify scope"]
-  d -->|Yes| review["Send to needs-review"]
+  accTitle: Instruction and skill context
+  accDescr: Shows always-loaded instructions separately from invoked skills.
+  global["Global: ${HOME}/AGENTS.md"] --> project["Project: <repo>/AGENTS.md"]
+  project --> composed["Composed prevention context"]
+  skill["Invoked skill: ${HOME}/.agents/skills/*/SKILL.md"] --> workflow["Workflow or detection context"]
+  composed --> decision{"Same scope conflict?"}
+  workflow --> decision
+  decision -->|No| keep["Keep both; clarify scope"]
+  decision -->|Yes| review["Send to needs-review"]
 ```
 
-## Conflict detection levels
+Project instructions and global instructions are prevention context when they
+are loaded before the agent acts. Skills are workflow context: they can be
+prevention only when the failing agent would normally invoke that skill before
+acting.
+
+## Conflict Detection Levels
 
 ```mermaid
 flowchart LR
@@ -196,6 +209,13 @@ flowchart LR
 ```
 
 The system currently supports a periodic audit via `audit-rules` (see below).
+
+## Architecture
+
+The routing model is documented in
+[`docs/composable-learning-architecture.md`](docs/composable-learning-architecture.md).
+That document defines prevention targets, detection targets, recurrence
+tracking, and draft-first upstreaming into reusable instruction templates.
 
 ## Skills
 
@@ -214,6 +234,21 @@ ordinary one-off capture.
 Use from scheduled automation or manually when promoting learning notes. It
 classifies new notes, handles reviewed checkbox decisions, promotes strong
 lessons, moves notes, writes reports, and validates changed files.
+
+Consolidations should follow the routing contract in
+[`docs/composable-learning-architecture.md`](docs/composable-learning-architecture.md#required-routing-contract)
+so reports distinguish prevention targets from detection targets. Pass
+`--enforce-routing` when finalizing promoted lessons that should have a
+prevention target.
+
+Create draft-first template handoffs with `create-template-draft`, then review
+them in the template repository before curated atom edits.
+
+Measure recurrence and routing gaps with:
+
+```bash
+python3 scripts/agent_learning.py summarize-runs --since "2026-06-01"
+```
 
 ### `audit-rules`
 
@@ -321,7 +356,7 @@ uses the local `msmtp` fallback through `scripts/agent_learning.py notify`.
 Run:
 
 ```bash
-markdownlint --config ~/.markdownlint.json AGENTS.md CHANGELOG.md README.md skills/**/*.md automations/*.md
+markdownlint --config ~/.markdownlint.json AGENTS.md CHANGELOG.md README.md docs/*.md skills/**/*.md automations/*.md
 shellcheck --enable=all install.sh
 python3 -m py_compile scripts/agent_learning.py tests/test_agent_learning.py
 python3 -m unittest discover -s tests

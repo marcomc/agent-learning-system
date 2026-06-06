@@ -265,6 +265,40 @@ status: "inbox"
             self.assertIn("requires --prevention-target", result.stderr)
             self.assertEqual(note.read_text(encoding="utf-8"), original)
 
+    def test_finalize_note_treats_empty_json_prevention_targets_as_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "empty-targets.md"
+            original = """---
+id: "empty-targets"
+status: "inbox"
+lesson_family: "empty-targets"
+scope: "atom"
+prevention_targets: "[]"
+detection_targets: "[]"
+routing_rationale: "Atom-scope lessons require a concrete prevention target."
+---
+# Empty Targets
+"""
+            note.write_text(original, encoding="utf-8")
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Empty JSON list is not a target.",
+                "--enforce-routing",
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires --prevention-target", result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+
     def test_finalize_note_enforces_routing_rationale_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config = self.write_config(Path(raw))

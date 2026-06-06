@@ -257,7 +257,7 @@ def unique_values(values: list[str]) -> list[str]:
     return unique
 
 
-def parse_json_list(value: str) -> list[str]:
+def parse_json_list_value(value: str) -> list[str] | None:
     if not value:
         return []
     try:
@@ -266,10 +266,14 @@ def parse_json_list(value: str) -> list[str]:
         try:
             payload = json.loads(value.replace('\\"', '"'))
         except json.JSONDecodeError:
-            return []
+            return None
     if not isinstance(payload, list):
-        return []
+        return None
     return [str(item) for item in payload if str(item).strip()]
+
+
+def parse_json_list(value: str) -> list[str]:
+    return parse_json_list_value(value) or []
 
 
 def coerce_list(value: Any) -> list[str]:
@@ -278,8 +282,8 @@ def coerce_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if str(item).strip()]
     if isinstance(value, str):
-        parsed = parse_json_list(value)
-        if parsed:
+        parsed = parse_json_list_value(value)
+        if parsed is not None:
             return parsed
         stripped = value.strip()
         return [stripped] if stripped else []

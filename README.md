@@ -9,6 +9,7 @@ reusable lessons into agent instructions and review skills.
 - [Purpose](#purpose)
 - [Repository Layout](#repository-layout)
 - [Install](#install)
+- [Full Pipeline Setup](#full-pipeline-setup)
 - [Learning Store](#learning-store)
 - [Instruction and Skill Context](#instruction-and-skill-context)
 - [Conflict Detection Levels](#conflict-detection-levels)
@@ -40,8 +41,11 @@ The system keeps learning lightweight and auditable:
 ├── automations/
 │   ├── midnight-consolidation.md
 │   ├── morning-review-email.md
-│   └── noon-consolidation.md
+│   ├── noon-consolidation.md
+│   ├── template-weekly-upstream-apply.md
+│   └── weekly-rule-audit.md
 ├── docs/
+│   ├── auto-learning-pipeline-automations.md
 │   └── composable-learning-architecture.md
 ├── scripts/
 │   └── agent_learning.py
@@ -67,7 +71,7 @@ The installer:
 - creates the learning store folders;
 - copies both skills into `~/.agents/skills`;
 - links `~/.codex/skills` to the installed `~/.agents/skills` copies;
-- installs or updates the three Codex automations as active;
+- installs or updates the daily Codex automations as active;
 - validates Markdown, shell, and Python files.
 
 Pass `--dir PATH` to choose any filesystem directory as the learning-store base.
@@ -108,6 +112,25 @@ flowchart LR
   mirror --> automations["Install active Codex automations"]
   automations --> done["Finish install"]
 ```
+
+## Full Pipeline Setup
+
+For the complete two-repository auto-learning pipeline, install this repository
+and the template repository, then ensure the weekly audit and template upstream
+automations exist.
+
+Follow
+[`docs/auto-learning-pipeline-automations.md`](docs/auto-learning-pipeline-automations.md)
+when asking an AI agent to create or repair the Codex automations. The runbook
+covers:
+
+| Component | Repo |
+| --- | --- |
+| Daily note consolidation | `agent-learning-system` |
+| Morning review notification | `agent-learning-system` |
+| Weekly duplicate and conflict audit | `agent-learning-system` |
+| Approved template draft apply | `agents-file-templates-and-skills` |
+| Generated-project refresh reports | `agents-file-templates-and-skills` |
 
 ## Learning Store
 
@@ -323,12 +346,16 @@ The active Codex automations should use the prompt files under `automations/`:
 
 - `agent-learning-midnight-consolidation` at `00:00` Europe/Rome;
 - `agent-learning-morning-review-email` at `08:30` Europe/Rome;
-- `agent-learning-noon-consolidation` at `12:00` Europe/Rome.
+- `agent-learning-noon-consolidation` at `12:00` Europe/Rome;
+- `agent-learning-weekly-rule-audit` weekly before template apply;
+- `agent-template-weekly-upstream-apply` weekly in the template repository.
 
 These automations are stored under `~/.codex/automations/` after Codex creates
 them. The shell installer also writes these records directly so a normal
 `./install.sh` run activates the daily loop without a separate manual Codex
-step.
+step. Use
+[`docs/auto-learning-pipeline-automations.md`](docs/auto-learning-pipeline-automations.md)
+for the full two-repository setup.
 
 This automation flow follows the prompt files in `automations/` and the
 notification behavior in `scripts/agent_learning.py notify`.
@@ -340,7 +367,11 @@ flowchart LR
   midnight["00:00 consolidation"] --> consolidate["Process inbox and reviews"]
   noon["12:00 consolidation"] --> consolidate
   consolidate --> promote["Promote safe lessons"]
+  promote --> draft["Create approved-review template drafts when useful"]
   promote --> report["Write report and validate"]
+  weekly["Weekly rule audit"] --> audit["Check duplicates and conflicts"]
+  draft --> template["Weekly template upstream apply"]
+  template --> refresh["Write out-of-sync report"]
   morning["08:30 review email"] --> pending{"Pending reviews?"}
   pending -->|No| quiet["Do not send email"]
   pending -->|Yes| gmail{"Gmail connector available?"}

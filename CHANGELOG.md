@@ -19,6 +19,8 @@ The project follows semantic versioning.
   duplicate-after-prevention metrics.
 - `create-template-draft` for clean, draft-first handoffs into the agent
   template repository.
+- AI-agent runbook and prompt source for installing the full two-repository
+  auto-learning automation pipeline.
 - Tests for routing enforcement, recurrence metrics, concurrent state updates,
   transactional finalization, and template draft privacy handling.
 

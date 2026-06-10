@@ -15,6 +15,7 @@ rules.
 - [Template Upstreaming](#template-upstreaming)
 - [Recurrence Measurement](#recurrence-measurement)
 - [Automation Policy](#automation-policy)
+- [Automation Install Runbook](#automation-install-runbook)
 
 ## Goal
 
@@ -219,3 +220,17 @@ python3 scripts/agent_learning.py summarize-runs \
 
 No automation should commit, push, or silently edit curated templates without an
 explicit apply request.
+
+## Automation Install Runbook
+
+The complete two-repository pipeline is documented in
+[`auto-learning-pipeline-automations.md`](auto-learning-pipeline-automations.md).
+
+That runbook is the source of truth for AI agents installing or repairing:
+
+| Automation Class | Repository |
+| --- | --- |
+| Daily consolidation and review notification | `agent-learning-system` |
+| Weekly rule audit | `agent-learning-system` |
+| Weekly approved-draft template apply | `agents-file-templates-and-skills` |
+| Out-of-sync reporting after template edits | `agents-file-templates-and-skills` |

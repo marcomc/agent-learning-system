@@ -9,7 +9,11 @@ reusable lessons into agent instructions and review skills.
 - [Purpose](#purpose)
 - [Repository Layout](#repository-layout)
 - [Install](#install)
+- [Full Pipeline Setup](#full-pipeline-setup)
 - [Learning Store](#learning-store)
+- [Instruction and Skill Context](#instruction-and-skill-context)
+- [Conflict Detection Levels](#conflict-detection-levels)
+- [Architecture](#architecture)
 - [Skills](#skills)
 - [Review Skill Hooks](#review-skill-hooks)
 - [Automations](#automations)
@@ -37,7 +41,12 @@ The system keeps learning lightweight and auditable:
 ├── automations/
 │   ├── midnight-consolidation.md
 │   ├── morning-review-email.md
-│   └── noon-consolidation.md
+│   ├── noon-consolidation.md
+│   ├── template-weekly-upstream-apply.md
+│   └── weekly-rule-audit.md
+├── docs/
+│   ├── auto-learning-pipeline-automations.md
+│   └── composable-learning-architecture.md
 ├── scripts/
 │   └── agent_learning.py
 ├── skills/
@@ -62,7 +71,7 @@ The installer:
 - creates the learning store folders;
 - copies both skills into `~/.agents/skills`;
 - links `~/.codex/skills` to the installed `~/.agents/skills` copies;
-- installs or updates the three Codex automations as active;
+- installs or updates the daily Codex automations as active;
 - validates Markdown, shell, and Python files.
 
 Pass `--dir PATH` to choose any filesystem directory as the learning-store base.
@@ -104,6 +113,25 @@ flowchart LR
   automations --> done["Finish install"]
 ```
 
+## Full Pipeline Setup
+
+For the complete two-repository auto-learning pipeline, install this repository
+and the template repository, then ensure the weekly audit and template upstream
+automations exist.
+
+Follow
+[`docs/auto-learning-pipeline-automations.md`](docs/auto-learning-pipeline-automations.md)
+when asking an AI agent to create or repair the Codex automations. The runbook
+covers:
+
+| Component | Repo |
+| --- | --- |
+| Daily note consolidation | `agent-learning-system` |
+| Morning review notification | `agent-learning-system` |
+| Weekly duplicate and conflict audit | `agent-learning-system` |
+| Approved template draft apply | `agents-file-templates-and-skills` |
+| Generated-project refresh reports | `agents-file-templates-and-skills` |
+
 ## Learning Store
 
 The canonical archive lives under `AGENT_LEARNING_DIR` plus
@@ -132,7 +160,8 @@ This creates:
 Obsidian vault, Obsidian sees the generated Markdown files as normal notes.
 
 > Source: `scripts/agent_learning.py` commands `record`, `prepare-run`,
-> `finalize-note`, and `write-report`.
+> `finalize-note`, `write-report`, `summarize-runs`, and
+> `create-template-draft`.
 
 ```mermaid
 flowchart LR
@@ -168,20 +197,27 @@ The consolidator reads `inbox/`, `needs-review/`, and `state/processed.json`.
 It does not reread `processed/` history unless resolving a duplicate or
 conflict.
 
-## Conflicts and precedence (visual)
+## Instruction and Skill Context
 
 ```mermaid
 flowchart LR
-  accTitle: Rule precedence when two rules disagree
-  accDescr: Shows which rule wins when guidance conflicts.
-  g["Global: $HOME/AGENTS.md"] --> p["Project: <repo>/AGENTS.md"]
-  p --> s["Domain skill: $HOME/.agents/skills/*/SKILL.md"]
-  s --> d{"Same scope?"}
-  d -->|No| keep["Keep both; clarify scope"]
-  d -->|Yes| review["Send to needs-review"]
+  accTitle: Instruction and skill context
+  accDescr: Shows always-loaded instructions separately from invoked skills.
+  global["Global: ${HOME}/AGENTS.md"] --> project["Project: <repo>/AGENTS.md"]
+  project --> composed["Composed prevention context"]
+  skill["Invoked skill: ${HOME}/.agents/skills/*/SKILL.md"] --> workflow["Workflow or detection context"]
+  composed --> decision{"Same scope conflict?"}
+  workflow --> decision
+  decision -->|No| keep["Keep both; clarify scope"]
+  decision -->|Yes| review["Send to needs-review"]
 ```
 
-## Conflict detection levels
+Project instructions and global instructions are prevention context when they
+are loaded before the agent acts. Skills are workflow context: they can be
+prevention only when the failing agent would normally invoke that skill before
+acting.
+
+## Conflict Detection Levels
 
 ```mermaid
 flowchart LR
@@ -196,6 +232,13 @@ flowchart LR
 ```
 
 The system currently supports a periodic audit via `audit-rules` (see below).
+
+## Architecture
+
+The routing model is documented in
+[`docs/composable-learning-architecture.md`](docs/composable-learning-architecture.md).
+That document defines prevention targets, detection targets, recurrence
+tracking, and draft-first upstreaming into reusable instruction templates.
 
 ## Skills
 
@@ -214,6 +257,21 @@ ordinary one-off capture.
 Use from scheduled automation or manually when promoting learning notes. It
 classifies new notes, handles reviewed checkbox decisions, promotes strong
 lessons, moves notes, writes reports, and validates changed files.
+
+Consolidations should follow the routing contract in
+[`docs/composable-learning-architecture.md`](docs/composable-learning-architecture.md#required-routing-contract)
+so reports distinguish prevention targets from detection targets. Pass
+`--enforce-routing` when finalizing promoted lessons that should have a
+prevention target.
+
+Create draft-first template handoffs with `create-template-draft`, then review
+them in the template repository before curated atom edits.
+
+Measure recurrence and routing gaps with:
+
+```bash
+python3 scripts/agent_learning.py summarize-runs --since "2026-06-01"
+```
 
 ### `audit-rules`
 
@@ -288,12 +346,16 @@ The active Codex automations should use the prompt files under `automations/`:
 
 - `agent-learning-midnight-consolidation` at `00:00` Europe/Rome;
 - `agent-learning-morning-review-email` at `08:30` Europe/Rome;
-- `agent-learning-noon-consolidation` at `12:00` Europe/Rome.
+- `agent-learning-noon-consolidation` at `12:00` Europe/Rome;
+- `agent-learning-weekly-rule-audit` weekly before template apply;
+- `agent-template-weekly-upstream-apply` weekly in the template repository.
 
 These automations are stored under `~/.codex/automations/` after Codex creates
 them. The shell installer also writes these records directly so a normal
 `./install.sh` run activates the daily loop without a separate manual Codex
-step.
+step. Use
+[`docs/auto-learning-pipeline-automations.md`](docs/auto-learning-pipeline-automations.md)
+for the full two-repository setup.
 
 This automation flow follows the prompt files in `automations/` and the
 notification behavior in `scripts/agent_learning.py notify`.
@@ -305,7 +367,11 @@ flowchart LR
   midnight["00:00 consolidation"] --> consolidate["Process inbox and reviews"]
   noon["12:00 consolidation"] --> consolidate
   consolidate --> promote["Promote safe lessons"]
+  promote --> draft["Create approved-review template drafts when useful"]
   promote --> report["Write report and validate"]
+  weekly["Weekly rule audit"] --> audit["Check duplicates and conflicts"]
+  draft --> template["Weekly template upstream apply"]
+  template --> refresh["Write out-of-sync report"]
   morning["08:30 review email"] --> pending{"Pending reviews?"}
   pending -->|No| quiet["Do not send email"]
   pending -->|Yes| gmail{"Gmail connector available?"}
@@ -321,7 +387,7 @@ uses the local `msmtp` fallback through `scripts/agent_learning.py notify`.
 Run:
 
 ```bash
-markdownlint --config ~/.markdownlint.json AGENTS.md CHANGELOG.md README.md skills/**/*.md automations/*.md
+markdownlint --config ~/.markdownlint.json AGENTS.md CHANGELOG.md README.md docs/*.md skills/**/*.md automations/*.md
 shellcheck --enable=all install.sh
 python3 -m py_compile scripts/agent_learning.py tests/test_agent_learning.py
 python3 -m unittest discover -s tests

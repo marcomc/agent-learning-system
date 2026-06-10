@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import difflib
 import json
 import os
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -42,8 +44,12 @@ PLACEHOLDER_EMAIL_PATTERN = re.compile(
 SECRET_ASSIGNMENT_PATTERN = (
     "(?i)" + r"\b(?:token|secret|password|cookie|api[_-]?key)\b\s*[:=]"
 )
+LOCAL_PATH_PATTERN = (
+    r"/(?:Users|home)/[A-Za-z0-9._-]+(?:/[^\s`'\"<>)]*)?"
+    r"|/(?:workspace|workspaces)/[A-Za-z0-9._-]+(?:/[^\s`'\"<>)]*)?"
+)
 PRIVATE_PATTERNS = [
-    re.compile("/" + r"Users/[A-Za-z0-9._-]+"),
+    re.compile(LOCAL_PATH_PATTERN),
     re.compile(EMAIL_PATTERN),
     re.compile(r"\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[0-1]))(?:\.\d{1,3}){2,3}\b"),
     re.compile(SECRET_ASSIGNMENT_PATTERN),
@@ -98,6 +104,19 @@ DEFAULT_AUDIT_SKILLS_DIR = Path.home() / ".agents" / "skills"
 DEFAULT_AUDIT_TARGETS = (Path.home() / "AGENTS.md",)
 DEFAULT_SIMILARITY_THRESHOLD = 0.92
 DEFAULT_CONFLICT_THRESHOLD = 0.78
+ROUTING_SCOPES = (
+    "global",
+    "atom",
+    "project-local",
+    "skill-prevention",
+    "skill-detection",
+    "needs-review",
+)
+TEMPLATE_UPSTREAM_STATUSES = ("not-applicable", "draft-created", "promoted", "deferred")
+RECURRENCE_CHECKS = ("new", "duplicate-before-promotion", "duplicate-after-prevention")
+STATE_LOCK_TIMEOUT_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS", "10.0"))
+STATE_LOCK_OWNERLESS_GRACE_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_OWNERLESS_GRACE_SECONDS", "5.0"))
+STATE_LOCK_OWNER_FILE = "owner.json"
 
 
 class ConfigError(RuntimeError):
@@ -150,7 +169,7 @@ def ensure_store(root: Path) -> None:
         (root / rel).mkdir(parents=True, exist_ok=True)
     state_path = root / "state" / "processed.json"
     if not state_path.exists():
-        state_path.write_text(json.dumps({"processed": {}}, indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(state_path, json.dumps({"processed": {}}, indent=2) + "\n")
 
 
 def slugify(value: str) -> str:
@@ -229,6 +248,336 @@ def unique_path(path: Path) -> Path:
     raise RuntimeError(f"Could not create unique path for {path}")
 
 
+def unique_values(values: list[str]) -> list[str]:
+    unique: list[str] = []
+    for value in values:
+        cleaned = value.strip()
+        if cleaned and cleaned not in unique:
+            unique.append(cleaned)
+    return unique
+
+
+def parse_json_list_value(value: str) -> list[str] | None:
+    if not value:
+        return []
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        try:
+            payload = json.loads(value.replace('\\"', '"'))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(payload, list):
+        return None
+    return [str(item) for item in payload if str(item).strip()]
+
+
+def parse_json_list(value: str) -> list[str]:
+    return parse_json_list_value(value) or []
+
+
+def coerce_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        parsed = parse_json_list_value(value)
+        if parsed is not None:
+            return parsed
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    return [str(value)]
+
+
+def json_list(values: list[str]) -> str:
+    return json.dumps(unique_values(values))
+
+
+def note_title(body: str, fallback: Path) -> str:
+    for raw in body.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or fallback.stem
+    return fallback.stem
+
+
+def routing_args_present(args: argparse.Namespace) -> bool:
+    fields = (
+        "lesson_family",
+        "scope",
+        "prevention_target",
+        "detection_target",
+        "template_upstream_status",
+        "routing_rationale",
+        "recurrence_check",
+    )
+    return any(bool(getattr(args, field, None)) for field in fields)
+
+
+def routing_from_args(
+    args: argparse.Namespace,
+    fm: dict[str, str] | None = None,
+    body: str = "",
+    source: Path | None = None,
+) -> dict[str, Any]:
+    current = fm or {}
+    fallback = source or Path("learning.md")
+    family = (
+        getattr(args, "lesson_family", None)
+        or current.get("lesson_family")
+        or slugify(note_title(body, fallback))
+    )
+    scope = getattr(args, "scope", None) or current.get("scope", "")
+    prevention_targets = unique_values(
+        coerce_list(current.get("prevention_targets")) + coerce_list(getattr(args, "prevention_target", None))
+    )
+    detection_targets = unique_values(
+        coerce_list(current.get("detection_targets")) + coerce_list(getattr(args, "detection_target", None))
+    )
+    template_status = (
+        getattr(args, "template_upstream_status", None)
+        or current.get("template_upstream_status")
+        or "not-applicable"
+    )
+    rationale = getattr(args, "routing_rationale", None) or current.get("routing_rationale", "")
+    recurrence = getattr(args, "recurrence_check", None) or current.get("recurrence_check") or "new"
+
+    metadata = {
+        "lesson_family": str(family),
+        "scope": str(scope),
+        "prevention_targets": prevention_targets,
+        "detection_targets": detection_targets,
+        "template_upstream_status": str(template_status),
+        "routing_rationale": str(rationale),
+        "recurrence_check": str(recurrence),
+    }
+    validate_routing_values(metadata)
+    return metadata
+
+
+def validate_routing_values(metadata: dict[str, Any]) -> None:
+    scope = str(metadata.get("scope", ""))
+    template_status = str(metadata.get("template_upstream_status", ""))
+    recurrence = str(metadata.get("recurrence_check", ""))
+    if scope and scope not in ROUTING_SCOPES:
+        raise ConfigError(f"Unsupported routing scope: {scope}")
+    if template_status and template_status not in TEMPLATE_UPSTREAM_STATUSES:
+        raise ConfigError(f"Unsupported template upstream status: {template_status}")
+    if recurrence and recurrence not in RECURRENCE_CHECKS:
+        raise ConfigError(f"Unsupported recurrence check: {recurrence}")
+
+
+def enforce_routing_contract(metadata: dict[str, Any]) -> None:
+    family = str(metadata.get("lesson_family", "")).strip()
+    scope = str(metadata.get("scope", "")).strip()
+    rationale = str(metadata.get("routing_rationale", "")).strip()
+    prevention_targets = metadata.get("prevention_targets") or []
+    detection_targets = metadata.get("detection_targets") or []
+    if not family:
+        raise ConfigError("Routing metadata requires --lesson-family.")
+    if not scope:
+        raise ConfigError("Routing metadata requires --scope.")
+    if scope != "needs-review" and not rationale:
+        raise ConfigError("Routing metadata requires --routing-rationale.")
+    if scope not in {"skill-detection", "needs-review"} and not prevention_targets:
+        raise ConfigError("Routing metadata requires --prevention-target for prevention-capable scopes.")
+    if scope == "skill-detection" and not detection_targets:
+        raise ConfigError("Routing metadata requires --detection-target for skill-detection scope.")
+
+
+def apply_routing_frontmatter(fm: dict[str, str], metadata: dict[str, Any]) -> None:
+    fm["lesson_family"] = str(metadata["lesson_family"])
+    fm["scope"] = str(metadata["scope"])
+    fm["prevention_targets"] = json_list(metadata["prevention_targets"])
+    fm["detection_targets"] = json_list(metadata["detection_targets"])
+    fm["template_upstream_status"] = str(metadata["template_upstream_status"])
+    fm["routing_rationale"] = str(metadata["routing_rationale"])
+    fm["recurrence_check"] = str(metadata["recurrence_check"])
+
+
+def routing_state_payload(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lesson_family": metadata["lesson_family"],
+        "scope": metadata["scope"],
+        "prevention_targets": metadata["prevention_targets"],
+        "detection_targets": metadata["detection_targets"],
+        "template_upstream_status": metadata["template_upstream_status"],
+        "routing_rationale": metadata["routing_rationale"],
+        "recurrence_check": metadata["recurrence_check"],
+    }
+
+
+def routing_markdown(metadata: dict[str, Any]) -> str:
+    prevention = metadata.get("prevention_targets") or []
+    detection = metadata.get("detection_targets") or []
+    lines = [
+        "## Routing Decision",
+        "",
+        f"- Lesson family: `{metadata.get('lesson_family') or 'not-recorded'}`",
+        f"- Scope: `{metadata.get('scope') or 'not-recorded'}`",
+        "- Prevention targets:",
+    ]
+    lines.extend(f"  - `{item}`" for item in prevention)
+    if not prevention:
+        lines.append("  - `none-recorded`")
+    lines.append("- Detection targets:")
+    lines.extend(f"  - `{item}`" for item in detection)
+    if not detection:
+        lines.append("  - `none-recorded`")
+    lines.extend(
+        [
+            f"- Template upstream status: `{metadata.get('template_upstream_status')}`",
+            f"- Routing rationale: {metadata.get('routing_rationale') or 'Not recorded.'}",
+            f"- Recurrence check: `{metadata.get('recurrence_check')}`",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def reclaim_dead_state_lock(lock_dir: Path) -> bool:
+    owner_path = lock_dir / STATE_LOCK_OWNER_FILE if lock_dir.is_dir() else lock_dir
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        pid = int(owner.get("pid"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+    if process_is_running(pid):
+        return False
+    try:
+        if lock_dir.is_dir():
+            owner_path.unlink()
+            lock_dir.rmdir()
+        else:
+            lock_dir.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def lock_age_seconds(lock_dir: Path) -> float:
+    try:
+        return time.time() - lock_dir.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def reclaim_ownerless_state_lock(lock_dir: Path) -> bool:
+    if not lock_dir.exists() or lock_age_seconds(lock_dir) < STATE_LOCK_OWNERLESS_GRACE_SECONDS:
+        return False
+    owner_path = lock_dir / STATE_LOCK_OWNER_FILE if lock_dir.is_dir() else lock_dir
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        int(owner.get("pid"))
+        return False
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
+    try:
+        if lock_dir.is_dir():
+            children = list(lock_dir.iterdir())
+            if children and not all(
+                child.name.startswith(f".{STATE_LOCK_OWNER_FILE}.") and child.name.endswith(".tmp")
+                for child in children
+            ):
+                return False
+            shutil.rmtree(lock_dir)
+        else:
+            lock_dir.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def acquire_state_lock_without_hardlink(lock_dir: Path, owner_payload: str) -> bool:
+    fd: int | None = None
+    try:
+        fd = os.open(lock_dir, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            handle.write(owner_payload)
+    except FileExistsError:
+        return False
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        try:
+            lock_dir.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return True
+
+
+def acquire_state_lock(lock_dir: Path) -> bool:
+    pending_path = lock_dir.with_name(f".{lock_dir.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    owner_payload = json.dumps({"pid": os.getpid()}) + "\n"
+    try:
+        pending_path.write_text(owner_payload, encoding="utf-8")
+        os.link(pending_path, lock_dir)
+    except FileExistsError:
+        return False
+    except OSError:
+        return acquire_state_lock_without_hardlink(lock_dir, owner_payload)
+    finally:
+        try:
+            pending_path.unlink()
+        except FileNotFoundError:
+            pass
+    return True
+
+
+@contextmanager
+def state_update_lock(root: Path):
+    lock_dir = root / "state" / ".processed.lock"
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + STATE_LOCK_TIMEOUT_SECONDS
+    acquired = False
+    while not acquired:
+        if acquire_state_lock(lock_dir):
+            acquired = True
+            continue
+        if reclaim_dead_state_lock(lock_dir) or reclaim_ownerless_state_lock(lock_dir):
+            continue
+        if time.monotonic() >= deadline:
+            raise ConfigError(f"Timed out waiting for state lock: {lock_dir}")
+        time.sleep(0.05)
+    try:
+        yield
+    finally:
+        if acquired:
+            try:
+                lock_dir.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def privacy_findings(text: str) -> list[str]:
+    return [pattern.pattern for pattern in PRIVATE_PATTERNS if pattern.search(text)]
+
+
 def read_json_input(source: str) -> dict[str, Any]:
     if source == "-":
         return json.load(sys.stdin)
@@ -271,6 +620,23 @@ def command_record(args: argparse.Namespace) -> int:
         "Promotion Decision": "Pending consolidation.",
     }
     body = f"# {title}\n\n" + "\n".join(section(name, value) for name, value in fields.items())
+    routing = routing_from_args(
+        argparse.Namespace(
+            lesson_family=data.get("lesson_family") or getattr(args, "lesson_family", None),
+            scope=data.get("scope") or getattr(args, "scope", None),
+            prevention_target=coerce_list(data.get("prevention_targets"))
+            + coerce_list(getattr(args, "prevention_target", None)),
+            detection_target=coerce_list(data.get("detection_targets"))
+            + coerce_list(getattr(args, "detection_target", None)),
+            template_upstream_status=data.get("template_upstream_status")
+            or getattr(args, "template_upstream_status", None),
+            routing_rationale=data.get("routing_rationale") or getattr(args, "routing_rationale", None),
+            recurrence_check=data.get("recurrence_check") or getattr(args, "recurrence_check", None),
+        ),
+        {},
+        body,
+        Path(f"{slugify(title)}.md"),
+    )
     fm = {
         "id": note_id,
         "created_at": now_iso(),
@@ -281,6 +647,7 @@ def command_record(args: argparse.Namespace) -> int:
         "genericity": genericity,
         "promoted_targets": "[]",
     }
+    apply_routing_frontmatter(fm, routing)
     filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(title)}-{note_id[:8]}.md"
     path = unique_path(root / "inbox" / filename)
     write_note(path, fm, body)
@@ -353,13 +720,23 @@ def command_prepare_run(args: argparse.Namespace) -> int:
 def load_state(root: Path) -> dict[str, Any]:
     state_path = root / "state" / "processed.json"
     if state_path.exists():
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        try:
+            return json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"State file is malformed: {state_path}") from exc
     return {"processed": {}}
 
 
 def save_state(root: Path, state: dict[str, Any]) -> None:
     state_path = root / "state" / "processed.json"
-    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def update_processed_state(root: Path, note_id: str, entry: dict[str, Any]) -> None:
+    with state_update_lock(root):
+        state = load_state(root)
+        state.setdefault("processed", {})[note_id] = entry
+        save_state(root, state)
 
 
 def command_finalize_note(args: argparse.Namespace) -> int:
@@ -367,9 +744,14 @@ def command_finalize_note(args: argparse.Namespace) -> int:
     root = learning_root(config)
     ensure_store(root)
     source = validate_note_source(root, Path(args.file))
-    fm, body = read_note(source)
+    original_text = source.read_text(encoding="utf-8")
+    fm, body = parse_frontmatter(original_text)
     note_id = fm.get("id", source.stem)
     status = args.status
+    routing = routing_from_args(args, fm, body, source)
+    if args.enforce_routing:
+        enforce_routing_contract(routing)
+    apply_routing_frontmatter(fm, routing)
     fm["status"] = status
     fm["processed_at"] = now_iso()
     fm["processing_rationale"] = args.rationale
@@ -386,23 +768,34 @@ def command_finalize_note(args: argparse.Namespace) -> int:
     else:
         raise SystemExit(f"Unsupported status: {status}")
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    write_note(source, fm, body)
-    if source == dest.resolve():
-        final = dest
-    else:
-        final = unique_path(dest)
-    if source != final.resolve():
-        shutil.move(str(source), str(final))
-
-    state = load_state(root)
-    state.setdefault("processed", {})[note_id] = {
-        "path": str(final),
-        "status": status,
-        "processed_at": fm["processed_at"],
-        "rationale": args.rationale,
-    }
-    save_state(root, state)
+    moved = False
+    final = dest
+    with state_update_lock(root):
+        state = load_state(root)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        write_note(source, fm, body)
+        if source == dest.resolve():
+            final = dest
+        else:
+            final = unique_path(dest)
+        try:
+            if source != final.resolve():
+                shutil.move(str(source), str(final))
+                moved = True
+            state.setdefault("processed", {})[note_id] = {
+                "path": str(final),
+                "status": status,
+                "processed_at": fm["processed_at"],
+                "rationale": args.rationale,
+                **routing_state_payload(routing),
+            }
+            save_state(root, state)
+        except Exception:
+            if moved and final.exists() and not source.exists():
+                shutil.move(str(final), str(source))
+            if source.exists():
+                source.write_text(original_text, encoding="utf-8")
+            raise
     print(final)
     return 0
 
@@ -413,6 +806,12 @@ def command_write_report(args: argparse.Namespace) -> int:
     ensure_store(root)
     run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
     path = unique_path(root / "reports" / f"{run_id}.md")
+    routing_section = ""
+    if routing_args_present(args):
+        routing = routing_from_args(args, {}, "", Path(f"{run_id}.md"))
+        if args.enforce_routing:
+            enforce_routing_contract(routing)
+        routing_section = "\n" + routing_markdown(routing)
     body = textwrap.dedent(
         f"""\
         # Agent Learning Consolidation {run_id}
@@ -422,11 +821,249 @@ def command_write_report(args: argparse.Namespace) -> int:
         ## Summary
 
         {args.summary.strip()}
+        {routing_section}
         """
     )
     path.write_text(body, encoding="utf-8")
     print(path)
     return 0
+
+
+def frontmatter_from_state_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    path_value = str(entry.get("path") or "")
+    path = Path(path_value) if path_value else Path()
+    if path_value and path.exists():
+        fm, _body = read_note(path)
+        return {
+            "lesson_family": fm.get("lesson_family", entry.get("lesson_family", "")),
+            "scope": fm.get("scope", entry.get("scope", "")),
+            "prevention_targets": parse_json_list(fm.get("prevention_targets", "")),
+            "detection_targets": parse_json_list(fm.get("detection_targets", "")),
+            "template_upstream_status": fm.get(
+                "template_upstream_status",
+                entry.get("template_upstream_status", ""),
+            ),
+            "routing_rationale": fm.get("routing_rationale", entry.get("routing_rationale", "")),
+            "recurrence_check": fm.get("recurrence_check", entry.get("recurrence_check", "")),
+        }
+    return {
+        "lesson_family": entry.get("lesson_family", ""),
+        "scope": entry.get("scope", ""),
+        "prevention_targets": coerce_list(entry.get("prevention_targets")),
+        "detection_targets": coerce_list(entry.get("detection_targets")),
+        "template_upstream_status": entry.get("template_upstream_status", ""),
+        "routing_rationale": entry.get("routing_rationale", ""),
+        "recurrence_check": entry.get("recurrence_check", ""),
+    }
+
+
+def processed_entry_in_window(entry: dict[str, Any], since: str) -> bool:
+    if not since:
+        return True
+    processed_at = str(entry.get("processed_at") or "")
+    return bool(processed_at) and processed_at[:10] >= since
+
+
+def validate_since_date(value: str) -> None:
+    if not value:
+        return
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ConfigError("--since must be a YYYY-MM-DD date.")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ConfigError("--since must be a YYYY-MM-DD date.") from exc
+
+
+def command_summarize_runs(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    root = learning_root(config)
+    ensure_store(root)
+    validate_since_date(args.since)
+    state = load_state(root)
+    processed = state.get("processed", {})
+    by_scope: dict[str, int] = {}
+    by_recurrence: dict[str, int] = {}
+    by_family: dict[str, int] = {}
+    duplicate_after_prevention = 0
+    missing_routing = 0
+    processed_count = 0
+
+    for entry in processed.values():
+        if not isinstance(entry, dict) or not processed_entry_in_window(entry, args.since):
+            continue
+        processed_count += 1
+        routing = frontmatter_from_state_entry(entry)
+        scope = str(routing.get("scope") or "not-recorded")
+        recurrence = str(routing.get("recurrence_check") or "not-recorded")
+        family = str(routing.get("lesson_family") or "not-recorded")
+        prevention_targets = routing.get("prevention_targets") or []
+        by_scope[scope] = by_scope.get(scope, 0) + 1
+        by_recurrence[recurrence] = by_recurrence.get(recurrence, 0) + 1
+        by_family[family] = by_family.get(family, 0) + 1
+        if recurrence == "duplicate-after-prevention":
+            duplicate_after_prevention += 1
+        if (
+            entry.get("status") == "processed"
+            and scope not in {"skill-detection", "needs-review"}
+            and not prevention_targets
+        ):
+            missing_routing += 1
+
+    payload = {
+        "learning_root": str(root),
+        "since": args.since or "",
+        "processed_count": processed_count,
+        "queue": {
+            "inbox": len(list((root / "inbox").glob("*.md"))),
+            "needs_review": len(list((root / "needs-review").glob("*.md"))),
+        },
+        "by_scope": dict(sorted(by_scope.items())),
+        "by_recurrence": dict(sorted(by_recurrence.items())),
+        "lesson_families": dict(sorted(by_family.items())),
+        "missing_routing_count": missing_routing,
+        "duplicate_after_prevention_count": duplicate_after_prevention,
+    }
+    if args.format == "markdown":
+        print(summary_markdown(payload))
+    else:
+        print(json.dumps(payload, indent=2))
+    return 0
+
+
+def summary_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        "# Agent Learning Run Summary",
+        "",
+        f"- Since: {payload['since'] or 'all-time'}",
+        f"- Processed: {payload['processed_count']}",
+        f"- Inbox: {payload['queue']['inbox']}",
+        f"- Needs review: {payload['queue']['needs_review']}",
+        f"- Missing routing: {payload['missing_routing_count']}",
+        f"- Duplicate after prevention: {payload['duplicate_after_prevention_count']}",
+        "",
+        "## Recurrence",
+        "",
+    ]
+    for key, count in payload["by_recurrence"].items():
+        lines.append(f"- `{key}`: {count}")
+    lines.extend(["", "## Scope", ""])
+    for key, count in payload["by_scope"].items():
+        lines.append(f"- `{key}`: {count}")
+    lines.extend(["", "## Lesson Families", ""])
+    for key, count in payload["lesson_families"].items():
+        lines.append(f"- `{key}`: {count}")
+    return "\n".join(lines)
+
+
+def command_create_template_draft(args: argparse.Namespace) -> int:
+    template_repo = Path(args.template_repo).expanduser().resolve()
+    if not (template_repo / "templates.yml").exists():
+        raise ConfigError(f"Template repository is missing templates.yml: {template_repo}")
+    lesson_family = args.lesson_family.strip()
+    if not lesson_family:
+        raise ConfigError("--lesson-family is required.")
+    candidate_rule = args.candidate_rule.strip()
+    if not candidate_rule:
+        raise ConfigError("--candidate-rule is required.")
+    if privacy_findings(candidate_rule):
+        raise ConfigError("Candidate rule must be scrubbed before writing a template draft.")
+    if args.privacy_verdict != "clean":
+        raise ConfigError("Template draft creation requires --privacy-verdict clean.")
+
+    metadata = {
+        "lesson_family": lesson_family,
+        "scope": "atom",
+        "prevention_targets": unique_values(args.prevention_target or []),
+        "detection_targets": unique_values(args.detection_target or []),
+        "template_upstream_status": "draft-created",
+        "routing_rationale": args.routing_rationale.strip(),
+        "recurrence_check": args.recurrence_check,
+    }
+    validate_routing_values(metadata)
+    if args.enforce_routing:
+        enforce_routing_contract(metadata)
+
+    source_note = Path(args.source_note).name
+    refresh_triggers = unique_values(args.refresh_trigger or [])
+    body = learning_upstream_draft_markdown(
+        lesson_family=lesson_family,
+        source_note=source_note,
+        proposed_template=args.proposed_template,
+        candidate_rule=candidate_rule,
+        metadata=metadata,
+        privacy_verdict=args.privacy_verdict,
+        review_status=args.review_status,
+        refresh_triggers=refresh_triggers,
+    )
+    if privacy_findings(body):
+        raise ConfigError("Draft body must be scrubbed before writing a template draft.")
+    draft_dir = template_repo / ".work" / "learning-upstream"
+    path = unique_path(draft_dir / f"{slugify(lesson_family)}.md")
+    atomic_write_text(path, body)
+    print(path)
+    return 0
+
+
+def learning_upstream_draft_markdown(
+    *,
+    lesson_family: str,
+    source_note: str,
+    proposed_template: str,
+    candidate_rule: str,
+    metadata: dict[str, Any],
+    privacy_verdict: str,
+    review_status: str,
+    refresh_triggers: list[str],
+) -> str:
+    prevention_targets = metadata.get("prevention_targets") or []
+    detection_targets = metadata.get("detection_targets") or []
+    lines = [
+        f"# Learning Upstream Draft: {lesson_family}",
+        "",
+        "## Handoff",
+        "",
+        f"- Lesson family: `{lesson_family}`",
+        f"- Source note: `{source_note}`",
+        f"- Proposed template: `{proposed_template}`",
+        f"- Review status: `{review_status}`",
+        f"- Privacy verdict: `{privacy_verdict}`",
+        f"- Recurrence check: `{metadata.get('recurrence_check')}`",
+        "",
+        "## Candidate Rule",
+        "",
+        candidate_rule,
+        "",
+        "## Prevention Targets",
+        "",
+    ]
+    lines.extend(f"- `{item}`" for item in prevention_targets)
+    if not prevention_targets:
+        lines.append("- `none-recorded`")
+    lines.extend(["", "## Detection Targets", ""])
+    lines.extend(f"- `{item}`" for item in detection_targets)
+    if not detection_targets:
+        lines.append("- `none-recorded`")
+    lines.extend(["", "## Refresh Triggers", ""])
+    lines.extend(f"- `{item}`" for item in refresh_triggers)
+    if not refresh_triggers:
+        lines.append("- `none-recorded`")
+    lines.extend(
+        [
+            "",
+            "## Routing Rationale",
+            "",
+            metadata.get("routing_rationale") or "Not recorded.",
+            "",
+            "## Review Decision",
+            "",
+            "- [ ] Promote to curated atom/template",
+            "- [ ] Defer for more evidence",
+            "- [ ] Reject as not reusable",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def pending_review_notes(root: Path) -> list[dict[str, str]]:
@@ -778,6 +1415,18 @@ def command_hook_review_skills(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_routing_arguments(parser: argparse.ArgumentParser, *, include_enforce: bool = False) -> None:
+    parser.add_argument("--lesson-family")
+    parser.add_argument("--scope", choices=ROUTING_SCOPES)
+    parser.add_argument("--prevention-target", action="append")
+    parser.add_argument("--detection-target", action="append")
+    parser.add_argument("--template-upstream-status", choices=TEMPLATE_UPSTREAM_STATUSES)
+    parser.add_argument("--routing-rationale")
+    parser.add_argument("--recurrence-check", choices=RECURRENCE_CHECKS)
+    if include_enforce:
+        parser.add_argument("--enforce-routing", action="store_true")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -799,6 +1448,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--verification")
     record.add_argument("--future-detection")
     record.add_argument("--future-prevention")
+    add_routing_arguments(record)
     record.set_defaults(func=command_record)
 
     prepare = sub.add_parser("prepare-run")
@@ -809,12 +1459,35 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--status", choices=["processed", "needs-review", "rejected"], required=True)
     finalize.add_argument("--rationale", required=True)
     finalize.add_argument("--run-id", default="")
+    add_routing_arguments(finalize, include_enforce=True)
     finalize.set_defaults(func=command_finalize_note)
 
     report = sub.add_parser("write-report")
     report.add_argument("--run-id", default="")
     report.add_argument("--summary", required=True)
+    add_routing_arguments(report, include_enforce=True)
     report.set_defaults(func=command_write_report)
+
+    summary = sub.add_parser("summarize-runs")
+    summary.add_argument("--since", default="")
+    summary.add_argument("--format", choices=["json", "markdown"], default="json")
+    summary.set_defaults(func=command_summarize_runs)
+
+    draft = sub.add_parser("create-template-draft")
+    draft.add_argument("--template-repo", required=True)
+    draft.add_argument("--lesson-family", required=True)
+    draft.add_argument("--source-note", required=True)
+    draft.add_argument("--proposed-template", required=True)
+    draft.add_argument("--candidate-rule", required=True)
+    draft.add_argument("--prevention-target", action="append")
+    draft.add_argument("--detection-target", action="append")
+    draft.add_argument("--routing-rationale", default="")
+    draft.add_argument("--recurrence-check", choices=RECURRENCE_CHECKS, default="new")
+    draft.add_argument("--privacy-verdict", choices=["clean", "needs-scrub", "blocked"], required=True)
+    draft.add_argument("--review-status", default="draft")
+    draft.add_argument("--refresh-trigger", action="append")
+    draft.add_argument("--enforce-routing", action="store_true")
+    draft.set_defaults(func=command_create_template_draft)
 
     notify = sub.add_parser("notify")
     notify.add_argument("--send-msmtp", action="store_true")

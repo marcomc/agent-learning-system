@@ -452,27 +452,32 @@ status: "inbox"
 # Locked
 """
             note.write_text(original, encoding="utf-8")
-            (root / "state" / ".processed.lock").mkdir()
+            lock_path = root / "state" / ".processed.lock"
+            lock_path.touch()
+            module = load_agent_learning_module()
 
-            result = self.run_helper(
-                config,
-                "finalize-note",
-                "--file",
-                str(note),
-                "--status",
-                "processed",
-                "--rationale",
-                "State lock is held.",
-                check=False,
-                env={"AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS": "0.05"},
-            )
+            with lock_path.open("r+", encoding="utf-8") as lock_file:
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_EX | module.fcntl.LOCK_NB)
+                result = self.run_helper(
+                    config,
+                    "finalize-note",
+                    "--file",
+                    str(note),
+                    "--status",
+                    "processed",
+                    "--rationale",
+                    "State lock is held.",
+                    check=False,
+                    env={"AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS": "0.05"},
+                )
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_UN)
 
             self.assertEqual(result.returncode, 2)
             self.assertIn("Timed out waiting for state lock", result.stderr)
             self.assertEqual(note.read_text(encoding="utf-8"), original)
             self.assertFalse(list((root / "processed").glob("**/*.md")))
 
-    def test_finalize_note_does_not_reclaim_owned_state_lock_by_age(self) -> None:
+    def test_finalize_note_lock_timeout_ignores_old_lock_file_age(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config = self.write_config(Path(raw))
             root = Path(self.run_helper(config, "init-store").stdout.strip())
@@ -484,75 +489,57 @@ status: "inbox"
 # Old Lock
 """
             note.write_text(original, encoding="utf-8")
-            lock_dir = root / "state" / ".processed.lock"
-            lock_dir.write_text(json.dumps({"pid": os.getpid()}) + "\n", encoding="utf-8")
+            lock_path = root / "state" / ".processed.lock"
+            lock_path.touch()
             old_time = time.time() - 3600
-            os.utime(lock_dir, (old_time, old_time))
+            os.utime(lock_path, (old_time, old_time))
+            module = load_agent_learning_module()
 
-            result = self.run_helper(
-                config,
-                "finalize-note",
-                "--file",
-                str(note),
-                "--status",
-                "processed",
-                "--rationale",
-                "State lock is held.",
-                check=False,
-                env={"AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS": "0.05"},
-            )
+            with lock_path.open("r+", encoding="utf-8") as lock_file:
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_EX | module.fcntl.LOCK_NB)
+                result = self.run_helper(
+                    config,
+                    "finalize-note",
+                    "--file",
+                    str(note),
+                    "--status",
+                    "processed",
+                    "--rationale",
+                    "State lock is held.",
+                    check=False,
+                    env={"AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS": "0.05"},
+                )
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_UN)
 
             self.assertEqual(result.returncode, 2)
             self.assertIn("Timed out waiting for state lock", result.stderr)
-            self.assertTrue(lock_dir.exists())
+            self.assertTrue(lock_path.exists())
             self.assertEqual(note.read_text(encoding="utf-8"), original)
             self.assertFalse(list((root / "processed").glob("**/*.md")))
 
-    def test_finalize_note_reclaims_old_ownerless_state_lock(self) -> None:
+    def test_state_lock_file_persists_for_safe_reacquisition(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            config = self.write_config(Path(raw))
-            root = Path(self.run_helper(config, "init-store").stdout.strip())
-            note = root / "inbox" / "ownerless.md"
-            note.write_text(
-                """---
-id: "ownerless"
-status: "inbox"
----
-# Ownerless
-""",
-                encoding="utf-8",
-            )
-            lock_dir = root / "state" / ".processed.lock"
-            lock_dir.mkdir()
-            old_time = time.time() - 3600
-            os.utime(lock_dir, (old_time, old_time))
+            root = Path(raw)
+            module = load_agent_learning_module()
+            lock_path = root / "state" / ".processed.lock"
+            for _ in range(2):
+                with module.state_update_lock(root):
+                    self.assertTrue(lock_path.is_file())
+                    self.assertEqual(json.loads(lock_path.read_text())["protocol"], "flock")
+            self.assertTrue(lock_path.exists())
 
-            result = self.run_helper(
-                config,
-                "finalize-note",
-                "--file",
-                str(note),
-                "--status",
-                "processed",
-                "--rationale",
-                "Ownerless lock recovered.",
-                "--lesson-family",
-                "lock-recovery",
-                "--scope",
-                "project-local",
-                "--prevention-target",
-                "project-local:agent-learning-system",
-                "--routing-rationale",
-                "Project automation preserves queue state.",
-                "--enforce-routing",
-                env={"AGENT_LEARNING_STATE_LOCK_OWNERLESS_GRACE_SECONDS": "0.01"},
-            )
+    def test_state_lock_rejects_legacy_directory_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            lock_path = root / "state" / ".processed.lock"
+            lock_path.mkdir(parents=True)
+            module = load_agent_learning_module()
 
-            moved = Path(result.stdout.strip())
-            self.assertTrue(moved.exists())
-            self.assertFalse(lock_dir.exists())
+            with self.assertRaisesRegex(module.ConfigError, "Legacy directory state lock"):
+                with module.state_update_lock(root):
+                    self.fail("legacy directory lock must not be used")
 
-    def test_state_lock_falls_back_when_hard_links_are_unavailable(self) -> None:
+    def test_state_lock_does_not_require_hard_links(self) -> None:
         agent_learning = load_agent_learning_module()
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -566,8 +553,8 @@ status: "inbox"
                 with agent_learning.state_update_lock(root):
                     lock_path = root / "state" / ".processed.lock"
                     self.assertTrue(lock_path.exists())
-                    self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8"))["pid"], os.getpid())
-                self.assertFalse((root / "state" / ".processed.lock").exists())
+                    self.assertFalse(lock_path.is_symlink())
+                    self.assertEqual(json.loads(lock_path.read_text())["protocol"], "flock")
             finally:
                 agent_learning.os.link = original_link
 
@@ -852,6 +839,7 @@ status: "inbox"
             config = self.write_config(directory)
             template_repo = directory / "templates"
             template_repo.mkdir()
+            private_ip = "10." + "0.0.1"
             (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
             result = self.run_helper(
                 config,
@@ -865,7 +853,7 @@ status: "inbox"
                 "--proposed-template",
                 "docs",
                 "--candidate-rule",
-                "Do not hard-code 10.0.0.1 in docs.",
+                f"Do not hard-code {private_ip} in docs.",
                 "--prevention-target",
                 "atom:docs",
                 "--privacy-verdict",
@@ -877,9 +865,11 @@ status: "inbox"
             self.assertIn("must be scrubbed", result.stderr)
 
     def test_create_template_draft_rejects_linux_local_candidate_rule(self) -> None:
+        linux_local_path = "/home/" + "alice/vault"
+        workspace_path = "/workspace/" + "private-repo"
         candidate_rules = [
-            "Do not write /home/alice/vault into shared handoffs.",
-            "Do not write /workspace/private-repo into shared handoffs.",
+            f"Do not write {linux_local_path} into shared handoffs.",
+            f"Do not write {workspace_path} into shared handoffs.",
         ]
         for candidate_rule in candidate_rules:
             with self.subTest(candidate_rule=candidate_rule):
@@ -939,7 +929,7 @@ status: "needs-review"
             self.assertEqual(result.returncode, 1)
             self.assertIn("AGENT_LEARNING_EMAIL is not configured", result.stderr)
 
-    def test_send_msmtp_supplies_from_header_for_envelope_discovery(self) -> None:
+    def test_send_msmtp_uses_configured_account_for_envelope_sender(self) -> None:
         module = load_agent_learning_module()
         with (
             patch.object(module.shutil, "which", return_value="/usr/local/bin/msmtp"),
@@ -950,8 +940,7 @@ status: "needs-review"
         self.assertEqual(run.call_args.args[0], ["msmtp", "--read-envelope-from", "-t"])
         self.assertEqual(
             run.call_args.kwargs["input"],
-            "From: reviewer@example.test\nTo: reviewer@example.test\n"
-            "Subject: Review needed\n\nOne note\n",
+            "To: reviewer@example.test\nSubject: Review needed\n\nOne note\n",
         )
 
     def test_hook_review_skills_only_updates_detected_review_skills(self) -> None:

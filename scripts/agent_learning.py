@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import difflib
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
@@ -19,6 +21,11 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the installer/runtime targets POSIX systems.
+    fcntl = None
 
 
 DEFAULT_CONFIG = Path.home() / ".config" / "agent-learning-system" / "config.env"
@@ -116,8 +123,6 @@ ROUTING_SCOPES = (
 TEMPLATE_UPSTREAM_STATUSES = ("not-applicable", "draft-created", "promoted", "deferred")
 RECURRENCE_CHECKS = ("new", "duplicate-before-promotion", "duplicate-after-prevention")
 STATE_LOCK_TIMEOUT_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS", "10.0"))
-STATE_LOCK_OWNERLESS_GRACE_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_OWNERLESS_GRACE_SECONDS", "5.0"))
-STATE_LOCK_OWNER_FILE = "owner.json"
 
 
 class ConfigError(RuntimeError):
@@ -447,132 +452,47 @@ def atomic_write_text(path: Path, text: str) -> None:
             tmp.unlink()
 
 
-def process_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def reclaim_dead_state_lock(lock_dir: Path) -> bool:
-    owner_path = lock_dir / STATE_LOCK_OWNER_FILE if lock_dir.is_dir() else lock_dir
-    try:
-        owner = json.loads(owner_path.read_text(encoding="utf-8"))
-        pid = int(owner.get("pid"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
-        return False
-    if process_is_running(pid):
-        return False
-    try:
-        if lock_dir.is_dir():
-            owner_path.unlink()
-            lock_dir.rmdir()
-        else:
-            lock_dir.unlink()
-    except OSError:
-        return False
-    return True
-
-
-def lock_age_seconds(lock_dir: Path) -> float:
-    try:
-        return time.time() - lock_dir.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def reclaim_ownerless_state_lock(lock_dir: Path) -> bool:
-    if not lock_dir.exists() or lock_age_seconds(lock_dir) < STATE_LOCK_OWNERLESS_GRACE_SECONDS:
-        return False
-    owner_path = lock_dir / STATE_LOCK_OWNER_FILE if lock_dir.is_dir() else lock_dir
-    try:
-        owner = json.loads(owner_path.read_text(encoding="utf-8"))
-        int(owner.get("pid"))
-        return False
-    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
-        pass
-    try:
-        if lock_dir.is_dir():
-            children = list(lock_dir.iterdir())
-            if children and not all(
-                child.name.startswith(f".{STATE_LOCK_OWNER_FILE}.") and child.name.endswith(".tmp")
-                for child in children
-            ):
-                return False
-            shutil.rmtree(lock_dir)
-        else:
-            lock_dir.unlink()
-    except OSError:
-        return False
-    return True
-
-
-def acquire_state_lock_without_hardlink(lock_dir: Path, owner_payload: str) -> bool:
-    fd: int | None = None
-    try:
-        fd = os.open(lock_dir, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = None
-            handle.write(owner_payload)
-    except FileExistsError:
-        return False
-    except Exception:
-        if fd is not None:
-            os.close(fd)
-        try:
-            lock_dir.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    return True
-
-
-def acquire_state_lock(lock_dir: Path) -> bool:
-    pending_path = lock_dir.with_name(f".{lock_dir.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    owner_payload = json.dumps({"pid": os.getpid()}) + "\n"
-    try:
-        pending_path.write_text(owner_payload, encoding="utf-8")
-        os.link(pending_path, lock_dir)
-    except FileExistsError:
-        return False
-    except OSError:
-        return acquire_state_lock_without_hardlink(lock_dir, owner_payload)
-    finally:
-        try:
-            pending_path.unlink()
-        except FileNotFoundError:
-            pass
-    return True
-
-
 @contextmanager
 def state_update_lock(root: Path):
-    lock_dir = root / "state" / ".processed.lock"
-    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = root / "state" / ".processed.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        raise ConfigError("State locking requires POSIX file locking support.")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except IsADirectoryError as exc:
+        raise ConfigError(f"Legacy directory state lock needs operator cleanup: {lock_path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to open state lock: {lock_path}: {exc}") from exc
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ConfigError(f"State lock must be a regular file: {lock_path}")
+    lock_file = os.fdopen(fd, "r+", encoding="utf-8")
     deadline = time.monotonic() + STATE_LOCK_TIMEOUT_SECONDS
     acquired = False
-    while not acquired:
-        if acquire_state_lock(lock_dir):
-            acquired = True
-            continue
-        if reclaim_dead_state_lock(lock_dir) or reclaim_ownerless_state_lock(lock_dir):
-            continue
-        if time.monotonic() >= deadline:
-            raise ConfigError(f"Timed out waiting for state lock: {lock_dir}")
-        time.sleep(0.05)
     try:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise ConfigError(f"Unable to acquire state lock: {lock_path}: {exc}") from exc
+                if time.monotonic() >= deadline:
+                    raise ConfigError(f"Timed out waiting for state lock: {lock_path}") from exc
+                time.sleep(0.05)
+        lock_file.seek(0)
+        lock_file.write(json.dumps({"protocol": "flock", "pid": os.getpid()}) + "\n")
+        lock_file.truncate()
+        lock_file.flush()
         yield
     finally:
-        if acquired:
-            try:
-                lock_dir.unlink()
-            except FileNotFoundError:
-                pass
+        try:
+            if acquired:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def privacy_findings(text: str) -> list[str]:
@@ -1342,7 +1262,7 @@ def notification_body(config: dict[str, str], root: Path) -> tuple[str, str] | N
 def send_msmtp(recipient: str, subject: str, body: str) -> None:
     if not shutil.which("msmtp"):
         raise SystemExit("msmtp is not available; configure Gmail connector or install msmtp.")
-    message = f"From: {recipient}\nTo: {recipient}\nSubject: {subject}\n\n{body}\n"
+    message = f"To: {recipient}\nSubject: {subject}\n\n{body}\n"
     subprocess.run(["msmtp", "--read-envelope-from", "-t"], input=message, text=True, check=True)
 
 

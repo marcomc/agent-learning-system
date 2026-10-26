@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "agent_learning.py"
+
+
+def load_agent_learning_module():
+    spec = importlib.util.spec_from_file_location("agent_learning_under_test", SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load agent_learning module for tests.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class AgentLearningTests(unittest.TestCase):
@@ -18,13 +31,17 @@ class AgentLearningTests(unittest.TestCase):
         config: Path,
         *args: str,
         check: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        clean_env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_LEARNING_")}
+        clean_env.update(env or {})
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--config", str(config), *args],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=check,
+            env=clean_env,
         )
 
     def write_config(self, directory: Path) -> Path:
@@ -93,6 +110,9 @@ class AgentLearningTests(unittest.TestCase):
             text = note.read_text(encoding="utf-8")
             self.assertIn("status: \"inbox\"", text)
             self.assertIn("## Future Prevention", text)
+            self.assertIn("lesson_family: \"config-drift-broke-validation\"", text)
+            self.assertIn("prevention_targets: \"[]\"", text)
+            self.assertIn("template_upstream_status: \"not-applicable\"", text)
 
     def test_new_config_uses_agent_learning_dir_as_base_directory(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -165,6 +185,411 @@ status: "inbox"
             self.assertEqual(state["processed"]["abc"]["status"], "processed")
             self.assertIn("/processed/", state["processed"]["abc"]["path"])
 
+    def test_finalize_note_records_routing_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "done.md"
+            note.write_text(
+                """---
+id: "abc"
+status: "inbox"
+---
+# Done
+""",
+                encoding="utf-8",
+            )
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Promoted to reusable template atom.",
+                "--lesson-family",
+                "markdown-validation-contract",
+                "--scope",
+                "atom",
+                "--prevention-target",
+                "atom:documentation-validation",
+                "--detection-target",
+                "skill:pre-pr-review-docs-release",
+                "--template-upstream-status",
+                "draft-created",
+                "--routing-rationale",
+                "Documentation agents load the atom before editing Markdown.",
+                "--recurrence-check",
+                "new",
+                "--enforce-routing",
+            )
+            moved = Path(result.stdout.strip())
+            text = moved.read_text(encoding="utf-8")
+            self.assertIn("lesson_family: \"markdown-validation-contract\"", text)
+            self.assertIn("prevention_targets: \"[\\\"atom:documentation-validation\\\"]\"", text)
+            state = json.loads((root / "state" / "processed.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["processed"]["abc"]["scope"], "atom")
+            self.assertEqual(state["processed"]["abc"]["template_upstream_status"], "draft-created")
+
+    def test_finalize_note_enforces_prevention_targets_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "done.md"
+            original = """---
+id: "abc"
+status: "inbox"
+---
+# Done
+"""
+            note.write_text(original, encoding="utf-8")
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Missing prevention target.",
+                "--lesson-family",
+                "missing-target",
+                "--scope",
+                "global",
+                "--routing-rationale",
+                "Global agents load this before acting.",
+                "--enforce-routing",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires --prevention-target", result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+
+    def test_finalize_note_treats_empty_json_prevention_targets_as_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "empty-targets.md"
+            original = """---
+id: "empty-targets"
+status: "inbox"
+lesson_family: "empty-targets"
+scope: "atom"
+prevention_targets: "[]"
+detection_targets: "[]"
+routing_rationale: "Atom-scope lessons require a concrete prevention target."
+---
+# Empty Targets
+"""
+            note.write_text(original, encoding="utf-8")
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Empty JSON list is not a target.",
+                "--enforce-routing",
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires --prevention-target", result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+
+    def test_finalize_note_enforces_routing_rationale_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "done.md"
+            original = """---
+id: "abc"
+status: "inbox"
+---
+# Done
+"""
+            note.write_text(original, encoding="utf-8")
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Missing routing rationale.",
+                "--lesson-family",
+                "missing-rationale",
+                "--scope",
+                "atom",
+                "--prevention-target",
+                "atom:docs",
+                "--enforce-routing",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires --routing-rationale", result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+
+    def test_finalize_note_enforces_detection_target_for_detection_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "detect.md"
+            note.write_text(
+                """---
+id: "detect"
+status: "inbox"
+---
+# Detect
+""",
+                encoding="utf-8",
+            )
+            missing = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Detection-only route.",
+                "--lesson-family",
+                "detection-only",
+                "--scope",
+                "skill-detection",
+                "--routing-rationale",
+                "Review skill catches the issue before final response.",
+                "--enforce-routing",
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("requires --detection-target", missing.stderr)
+
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Detection-only route.",
+                "--lesson-family",
+                "detection-only",
+                "--scope",
+                "skill-detection",
+                "--detection-target",
+                "skill:pre-pr-review-docs-release",
+                "--routing-rationale",
+                "Review skill catches the issue before final response.",
+                "--enforce-routing",
+            )
+            moved = Path(result.stdout.strip())
+            self.assertTrue(moved.exists())
+
+    def test_concurrent_finalize_note_preserves_state_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            notes = []
+            for note_id in ["one", "two"]:
+                note = root / "inbox" / f"{note_id}.md"
+                note.write_text(
+                    f"""---
+id: "{note_id}"
+status: "inbox"
+---
+# {note_id}
+""",
+                    encoding="utf-8",
+                )
+                notes.append(note)
+
+            clean_env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_LEARNING_")}
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT),
+                        "--config",
+                        str(config),
+                        "finalize-note",
+                        "--file",
+                        str(note),
+                        "--status",
+                        "processed",
+                        "--rationale",
+                        f"Processed {note.stem}.",
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=clean_env,
+                )
+                for note in notes
+            ]
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr or stdout)
+
+            state = json.loads((root / "state" / "processed.json").read_text(encoding="utf-8"))
+            self.assertIn("one", state["processed"])
+            self.assertIn("two", state["processed"])
+
+    def test_finalize_note_lock_failure_keeps_note_in_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "locked.md"
+            original = """---
+id: "locked"
+status: "inbox"
+---
+# Locked
+"""
+            note.write_text(original, encoding="utf-8")
+            lock_path = root / "state" / ".processed.lock"
+            lock_path.touch()
+            module = load_agent_learning_module()
+
+            with lock_path.open("r+", encoding="utf-8") as lock_file:
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_EX | module.fcntl.LOCK_NB)
+                result = self.run_helper(
+                    config,
+                    "finalize-note",
+                    "--file",
+                    str(note),
+                    "--status",
+                    "processed",
+                    "--rationale",
+                    "State lock is held.",
+                    check=False,
+                    env={"AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS": "0.05"},
+                )
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_UN)
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Timed out waiting for state lock", result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+            self.assertFalse(list((root / "processed").glob("**/*.md")))
+
+    def test_finalize_note_lock_timeout_ignores_old_lock_file_age(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "old-lock.md"
+            original = """---
+id: "old-lock"
+status: "inbox"
+---
+# Old Lock
+"""
+            note.write_text(original, encoding="utf-8")
+            lock_path = root / "state" / ".processed.lock"
+            lock_path.touch()
+            old_time = time.time() - 3600
+            os.utime(lock_path, (old_time, old_time))
+            module = load_agent_learning_module()
+
+            with lock_path.open("r+", encoding="utf-8") as lock_file:
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_EX | module.fcntl.LOCK_NB)
+                result = self.run_helper(
+                    config,
+                    "finalize-note",
+                    "--file",
+                    str(note),
+                    "--status",
+                    "processed",
+                    "--rationale",
+                    "State lock is held.",
+                    check=False,
+                    env={"AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS": "0.05"},
+                )
+                module.fcntl.flock(lock_file.fileno(), module.fcntl.LOCK_UN)
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Timed out waiting for state lock", result.stderr)
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+            self.assertFalse(list((root / "processed").glob("**/*.md")))
+
+    def test_state_lock_file_persists_for_safe_reacquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            module = load_agent_learning_module()
+            lock_path = root / "state" / ".processed.lock"
+            for _ in range(2):
+                with module.state_update_lock(root):
+                    self.assertTrue(lock_path.is_file())
+                    self.assertEqual(json.loads(lock_path.read_text())["protocol"], "flock")
+            self.assertTrue(lock_path.exists())
+
+    def test_state_lock_rejects_legacy_directory_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            lock_path = root / "state" / ".processed.lock"
+            lock_path.mkdir(parents=True)
+            module = load_agent_learning_module()
+
+            with self.assertRaisesRegex(module.ConfigError, "Legacy directory state lock"):
+                with module.state_update_lock(root):
+                    self.fail("legacy directory lock must not be used")
+
+    def test_state_lock_does_not_require_hard_links(self) -> None:
+        agent_learning = load_agent_learning_module()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            original_link = agent_learning.os.link
+
+            def fail_link(_source: Path, _dest: Path) -> None:
+                raise OSError("hard links unavailable")
+
+            agent_learning.os.link = fail_link
+            try:
+                with agent_learning.state_update_lock(root):
+                    lock_path = root / "state" / ".processed.lock"
+                    self.assertTrue(lock_path.exists())
+                    self.assertFalse(lock_path.is_symlink())
+                    self.assertEqual(json.loads(lock_path.read_text())["protocol"], "flock")
+            finally:
+                agent_learning.os.link = original_link
+
+    def test_finalize_note_malformed_state_keeps_note_in_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "bad-state.md"
+            original = """---
+id: "bad-state"
+status: "inbox"
+---
+# Bad State
+"""
+            note.write_text(original, encoding="utf-8")
+            state_path = root / "state" / "processed.json"
+            state_path.write_text("{", encoding="utf-8")
+
+            result = self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Malformed state blocks processing.",
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("State file is malformed", result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), original)
+            self.assertFalse(list((root / "processed").glob("**/*.md")))
+
     def test_finalize_note_rejects_file_outside_learning_store(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)
@@ -223,6 +648,261 @@ status: "needs-review"
             self.assertTrue(note.exists())
             self.assertFalse((root / "needs-review" / "review-2.md").exists())
 
+    def test_write_report_can_include_routing_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            result = self.run_helper(
+                config,
+                "write-report",
+                "--run-id",
+                "run-1",
+                "--summary",
+                "Processed one reusable lesson.",
+                "--lesson-family",
+                "markdown-validation-contract",
+                "--scope",
+                "atom",
+                "--prevention-target",
+                "atom:documentation-validation",
+                "--template-upstream-status",
+                "draft-created",
+                "--routing-rationale",
+                "Documentation agents load the atom before editing Markdown.",
+                "--recurrence-check",
+                "new",
+                "--enforce-routing",
+            )
+            report = Path(result.stdout.strip())
+            self.assertEqual(report.parent, root / "reports")
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("## Routing Decision", text)
+            self.assertIn("Lesson family: `markdown-validation-contract`", text)
+            self.assertIn("Processed one reusable lesson.\n\n## Routing Decision", text)
+            self.assertNotIn("\n\n\n", text)
+
+    def test_write_report_without_routing_has_no_multiple_blank_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            result = self.run_helper(
+                config,
+                "write-report",
+                "--run-id",
+                "run-2",
+                "--summary",
+                "Processed no notes.",
+            )
+            report = Path(result.stdout.strip())
+            self.assertEqual(report, root / "reports" / "run-2.md")
+            self.assertNotIn("\n\n\n", report.read_text(encoding="utf-8"))
+
+    def test_summarize_runs_counts_recurrence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            note = root / "inbox" / "done.md"
+            note.write_text(
+                """---
+id: "abc"
+status: "inbox"
+---
+# Done
+""",
+                encoding="utf-8",
+            )
+            self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(note),
+                "--status",
+                "processed",
+                "--rationale",
+                "Repeated after prevention.",
+                "--lesson-family",
+                "markdown-validation-contract",
+                "--scope",
+                "atom",
+                "--prevention-target",
+                "atom:documentation-validation",
+                "--recurrence-check",
+                "duplicate-after-prevention",
+            )
+            rejected = root / "inbox" / "rejected.md"
+            rejected.write_text(
+                """---
+id: "rejected"
+status: "inbox"
+---
+# Rejected
+""",
+                encoding="utf-8",
+            )
+            self.run_helper(
+                config,
+                "finalize-note",
+                "--file",
+                str(rejected),
+                "--status",
+                "rejected",
+                "--rationale",
+                "Not reusable.",
+            )
+            result = self.run_helper(config, "summarize-runs", "--format", "json")
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["processed_count"], 2)
+            self.assertEqual(payload["duplicate_after_prevention_count"], 1)
+            self.assertEqual(payload["missing_routing_count"], 0)
+            self.assertEqual(payload["lesson_families"]["markdown-validation-contract"], 1)
+
+            datetime_since = self.run_helper(
+                config,
+                "summarize-runs",
+                "--since",
+                "2026-06-01T12:00:00",
+                check=False,
+            )
+            self.assertEqual(datetime_since.returncode, 2)
+            self.assertIn("YYYY-MM-DD", datetime_since.stderr)
+
+    def test_create_template_draft_uses_source_note_filename_only(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            template_repo = directory / "templates"
+            template_repo.mkdir()
+            (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
+            source_note = directory / "private" / "note.md"
+            result = self.run_helper(
+                config,
+                "create-template-draft",
+                "--template-repo",
+                str(template_repo),
+                "--lesson-family",
+                "markdown-validation-contract",
+                "--source-note",
+                str(source_note),
+                "--proposed-template",
+                "documentation-validation",
+                "--candidate-rule",
+                "Run markdownlint before completing Markdown documentation changes.",
+                "--prevention-target",
+                "atom:documentation-validation",
+                "--routing-rationale",
+                "Documentation agents load the atom before editing Markdown.",
+                "--privacy-verdict",
+                "clean",
+                "--enforce-routing",
+            )
+            draft = Path(result.stdout.strip())
+            text = draft.read_text(encoding="utf-8")
+            self.assertIn("Source note: `note.md`", text)
+            self.assertNotIn(str(source_note), text)
+
+    def test_create_template_draft_requires_clean_privacy_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            template_repo = directory / "templates"
+            template_repo.mkdir()
+            (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
+            result = self.run_helper(
+                config,
+                "create-template-draft",
+                "--template-repo",
+                str(template_repo),
+                "--lesson-family",
+                "blocked",
+                "--source-note",
+                "note.md",
+                "--proposed-template",
+                "docs",
+                "--candidate-rule",
+                "Run markdownlint before completing Markdown documentation changes.",
+                "--prevention-target",
+                "atom:docs",
+                "--privacy-verdict",
+                "blocked",
+                "--routing-rationale",
+                "Docs agents load this atom before editing documentation.",
+                "--enforce-routing",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires --privacy-verdict clean", result.stderr)
+            self.assertFalse((template_repo / ".work").exists())
+
+    def test_create_template_draft_rejects_private_candidate_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            template_repo = directory / "templates"
+            template_repo.mkdir()
+            private_ip = "10." + "0.0.1"
+            (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
+            result = self.run_helper(
+                config,
+                "create-template-draft",
+                "--template-repo",
+                str(template_repo),
+                "--lesson-family",
+                "private-path",
+                "--source-note",
+                "note.md",
+                "--proposed-template",
+                "docs",
+                "--candidate-rule",
+                f"Do not hard-code {private_ip} in docs.",
+                "--prevention-target",
+                "atom:docs",
+                "--privacy-verdict",
+                "needs-scrub",
+                "--enforce-routing",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("must be scrubbed", result.stderr)
+
+    def test_create_template_draft_rejects_linux_local_candidate_rule(self) -> None:
+        linux_local_path = "/home/" + "alice/vault"
+        workspace_path = "/workspace/" + "private-repo"
+        candidate_rules = [
+            f"Do not write {linux_local_path} into shared handoffs.",
+            f"Do not write {workspace_path} into shared handoffs.",
+        ]
+        for candidate_rule in candidate_rules:
+            with self.subTest(candidate_rule=candidate_rule):
+                with tempfile.TemporaryDirectory() as raw:
+                    directory = Path(raw)
+                    config = self.write_config(directory)
+                    template_repo = directory / "templates"
+                    template_repo.mkdir()
+                    (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
+                    result = self.run_helper(
+                        config,
+                        "create-template-draft",
+                        "--template-repo",
+                        str(template_repo),
+                        "--lesson-family",
+                        "private-path",
+                        "--source-note",
+                        "note.md",
+                        "--proposed-template",
+                        "docs",
+                        "--candidate-rule",
+                        candidate_rule,
+                        "--prevention-target",
+                        "atom:docs",
+                        "--privacy-verdict",
+                        "clean",
+                        "--enforce-routing",
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("must be scrubbed", result.stderr)
+                    self.assertFalse((template_repo / ".work").exists())
+
     def test_notify_refuses_placeholder_email_for_msmtp(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config = self.write_config(Path(raw))
@@ -248,6 +928,20 @@ status: "needs-review"
             result = self.run_helper(config, "notify", "--send-msmtp", check=False)
             self.assertEqual(result.returncode, 1)
             self.assertIn("AGENT_LEARNING_EMAIL is not configured", result.stderr)
+
+    def test_send_msmtp_uses_configured_account_for_envelope_sender(self) -> None:
+        module = load_agent_learning_module()
+        with (
+            patch.object(module.shutil, "which", return_value="/usr/local/bin/msmtp"),
+            patch.object(module.subprocess, "run") as run,
+        ):
+            module.send_msmtp("reviewer@example.test", "Review needed", "One note")
+
+        self.assertEqual(run.call_args.args[0], ["msmtp", "--read-envelope-from", "-t"])
+        self.assertEqual(
+            run.call_args.kwargs["input"],
+            "To: reviewer@example.test\nSubject: Review needed\n\nOne note\n",
+        )
 
     def test_hook_review_skills_only_updates_detected_review_skills(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

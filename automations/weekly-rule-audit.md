@@ -7,6 +7,7 @@ push.
 
 Catch long-term drift: duplicate or potentially conflicting rules that have
 accumulated across `$HOME/AGENTS.md` and installed `$HOME/.agents/skills`.
+Also report repeated lessons after a prevention target exists.
 
 ## Steps
 
@@ -20,11 +21,22 @@ python3 "${repo}/scripts/agent_learning.py" audit-rules \
   > /tmp/agent-learning-audit.json
 ```
 
-If `potential_conflicts` or `near_duplicates` is non-empty, write a short
-Obsidian note under `AI Agent Learnings/reports/` summarizing:
+Summarize recurrence:
+
+```bash
+repo="/path/to/agent-learning-system"
+python3 "${repo}/scripts/agent_learning.py" summarize-runs \
+  --format markdown \
+  > /tmp/agent-learning-recurrence.md
+```
+
+If `potential_conflicts`, `near_duplicates`, missing routing, or duplicate
+after-prevention counts are non-empty, write a short Obsidian note under
+`AI Agent Learnings/reports/` summarizing:
 
 - counts for `exact_duplicates`, `near_duplicates`, `potential_conflicts`;
+- recurrence counts and missing routing count;
 - the top 3 highest-ratio pairs with file paths + line numbers;
 - the recommended action: merge/clarify scope or move to `needs-review`.
 
-If all three lists are empty, do nothing.
+If the audit and recurrence summary are clean, do nothing.

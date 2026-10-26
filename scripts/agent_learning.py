@@ -122,6 +122,15 @@ ROUTING_SCOPES = (
 )
 TEMPLATE_UPSTREAM_STATUSES = ("not-applicable", "draft-created", "promoted", "deferred")
 RECURRENCE_CHECKS = ("new", "duplicate-before-promotion", "duplicate-after-prevention")
+ROUTING_TARGET_SCHEMES = {
+    "atom",
+    "global",
+    "needs-review",
+    "project-local",
+    "skill",
+    "skill-detection",
+    "skill-prevention",
+}
 STATE_LOCK_TIMEOUT_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS", "10.0"))
 
 
@@ -372,6 +381,19 @@ def validate_routing_values(metadata: dict[str, Any]) -> None:
         raise ConfigError(f"Unsupported template upstream status: {template_status}")
     if recurrence and recurrence not in RECURRENCE_CHECKS:
         raise ConfigError(f"Unsupported recurrence check: {recurrence}")
+
+
+def concrete_routing_target_path(value: str) -> Path | None:
+    """Resolve file targets; logical schemes accept only extensionless leaf labels."""
+    scheme, separator, target = value.partition(":")
+    if separator and scheme in ROUTING_TARGET_SCHEMES:
+        if (target and "/" not in target and "\\" not in target
+                and not target.startswith((".", "~"))
+                and not Path(target).suffix):
+            return None
+        if target:
+            return Path(target).expanduser().resolve()
+    return Path(value).expanduser().resolve()
 
 
 def enforce_routing_contract(metadata: dict[str, Any]) -> None:
@@ -721,7 +743,7 @@ def instruction_target(path: Path, root: Path) -> bool:
 
 def validate_autonomous_review(
     config: dict[str, str], root: Path, source: Path, note_id: str,
-    body: str, args: argparse.Namespace, state: dict[str, Any],
+    body: str, args: argparse.Namespace, state: dict[str, Any], routing: dict[str, Any],
 ) -> dict[str, str]:
     """Check delegated authority and receipt integrity, not semantic truth."""
     if not review_policy(config)["autonomous_instructions"]:
@@ -804,9 +826,9 @@ def validate_autonomous_review(
         if hashlib.sha256(path.read_bytes()).hexdigest() != target.get("sha256"):
             raise ConfigError("Stale instruction target in autonomous review receipt.")
         verified_targets.add(path)
-    for value in (args.prevention_target or []) + (args.detection_target or []):
-        path = Path(value).expanduser()
-        if path.is_absolute() and path.resolve() not in verified_targets:
+    for value in routing["prevention_targets"] + routing["detection_targets"]:
+        path = concrete_routing_target_path(value)
+        if path is not None and path not in verified_targets:
             raise ConfigError("Concrete routing targets must match verified receipt targets.")
     return {
         "review_authority": "autonomous-instructions",
@@ -854,7 +876,9 @@ def command_finalize_note(args: argparse.Namespace) -> int:
         if args.review_evidence:
             if source.read_text(encoding="utf-8") != original_text:
                 raise ConfigError("Review source changed while waiting for finalization.")
-            review_metadata = validate_autonomous_review(config, root, source, note_id, body, args, state)
+            review_metadata = validate_autonomous_review(
+                config, root, source, note_id, body, args, state, routing
+            )
             fm.update(review_metadata)
         dest.parent.mkdir(parents=True, exist_ok=True)
         write_note(source, fm, body)

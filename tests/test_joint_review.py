@@ -73,19 +73,41 @@ class JointReviewTests(unittest.TestCase):
         path.write_text(json.dumps(data))
         return path, data
 
-    def finalize(self, note: Path, receipt: Path, check: bool = True):
-        return self.run_helper(
+    def finalize(
+        self,
+        note: Path,
+        receipt: Path,
+        check: bool = True,
+        routing_target: str | None = None,
+        include_routing_target: bool = True,
+    ):
+        args = [
             "finalize-note", "--file", str(note), "--status", "processed",
             "--rationale", "Corroborated and covered by current instruction.",
             "--review-evidence", str(receipt), "--scope", "project-local",
-            "--prevention-target", str(self.target), "--lesson-family", "bounded-failure-path",
+            "--lesson-family", "bounded-failure-path",
             "--routing-rationale", "Owning project loads verified rule.", "--enforce-routing",
+        ]
+        if include_routing_target:
+            args.extend(["--prevention-target", routing_target or str(self.target)])
+        return self.run_helper(
+            *args,
             check=check,
         )
 
-    def assert_refused(self, note: Path, receipt: Path, message: str = "") -> None:
+    def assert_refused(
+        self,
+        note: Path,
+        receipt: Path,
+        message: str = "",
+        routing_target: str | None = None,
+        include_routing_target: bool = True,
+    ) -> None:
         before = note.read_bytes()
-        result = self.finalize(note, receipt, check=False)
+        result = self.finalize(
+            note, receipt, check=False, routing_target=routing_target,
+            include_routing_target=include_routing_target,
+        )
         self.assertEqual(result.returncode, 2, result.stderr)
         if message:
             self.assertIn(message, result.stderr)
@@ -172,7 +194,7 @@ class JointReviewTests(unittest.TestCase):
     def test_pending_review_report_rejects_foreign_evidence(self) -> None:
         self.set_policy(threshold="2")
         notes = [self.note("a"), self.note("b")]
-        receipt, _ = self.receipt(notes)
+        receipt, data = self.receipt(notes)
         foreign = self.directory / "foreign.json"
         foreign.write_bytes(receipt.read_bytes())
         result = self.run_helper("write-report", "--summary", "Foreign.", "--review-evidence", str(foreign), check=False)
@@ -266,7 +288,55 @@ class JointReviewTests(unittest.TestCase):
         other.write_text("# Other instruction\n")
         data["decisions"][0]["targets"] = [{"path": str(other), "sha256": hashlib.sha256(other.read_bytes()).hexdigest()}]
         receipt.write_text(json.dumps(data))
-        self.assert_refused(notes[0], receipt, "Concrete routing targets")
+        relative_target = os.path.relpath(self.target, Path.cwd())
+        for target in (
+            str(self.target),
+            relative_target,
+            f"project-local:{relative_target}",
+            "project-local:AGENTS.md",
+        ):
+            with self.subTest(target=target):
+                self.assert_refused(notes[0], receipt, "Concrete routing targets", target)
+
+    def test_relative_concrete_routing_target_matches_receipt(self) -> None:
+        notes = [self.note("a"), self.note("b")]
+        receipt, _ = self.receipt(notes)
+        relative_target = os.path.relpath(self.target, Path.cwd())
+
+        result = self.finalize(notes[0], receipt, routing_target=relative_target)
+
+        archived = Path(result.stdout.strip())
+        frontmatter, _body = module.read_note(archived)
+        self.assertEqual(module.parse_json_list(frontmatter["prevention_targets"]), [relative_target])
+
+    def test_extensionless_logical_target_scheme_remains_supported(self) -> None:
+        notes = [self.note("a"), self.note("b")]
+        receipt, _ = self.receipt(notes)
+
+        result = self.finalize(notes[0], receipt, routing_target="project-local:learning-system")
+
+        archived = Path(result.stdout.strip())
+        frontmatter, _body = module.read_note(archived)
+        self.assertEqual(
+            module.parse_json_list(frontmatter["prevention_targets"]),
+            ["project-local:learning-system"],
+        )
+
+    def test_concrete_frontmatter_target_must_match_receipt(self) -> None:
+        notes = [self.note("a"), self.note("b")]
+        receipt, data = self.receipt(notes)
+        other = self.directory / "other" / "AGENTS.md"
+        other.parent.mkdir()
+        other.write_text("# Other instruction\n")
+        frontmatter, body = module.read_note(notes[0])
+        frontmatter["prevention_targets"] = json.dumps([str(other)])
+        module.write_note(notes[0], frontmatter, body)
+        data["sources"][0]["sha256"] = hashlib.sha256(notes[0].read_bytes()).hexdigest()
+        receipt.write_text(json.dumps(data))
+
+        self.assert_refused(
+            notes[0], receipt, "Concrete routing targets", include_routing_target=False
+        )
 
     def test_project_agent_procedures_require_a_loaded_root_pointer(self) -> None:
         root_instruction = self.target

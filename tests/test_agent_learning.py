@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -690,6 +691,24 @@ status: "needs-review"
             text = report.read_text(encoding="utf-8")
             self.assertIn("## Routing Decision", text)
             self.assertIn("Lesson family: `markdown-validation-contract`", text)
+            self.assertIn("Processed one reusable lesson.\n\n## Routing Decision", text)
+            self.assertNotIn("\n\n\n", text)
+
+    def test_write_report_without_routing_has_no_multiple_blank_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            result = self.run_helper(
+                config,
+                "write-report",
+                "--run-id",
+                "run-2",
+                "--summary",
+                "Processed no notes.",
+            )
+            report = Path(result.stdout.strip())
+            self.assertEqual(report, root / "reports" / "run-2.md")
+            self.assertNotIn("\n\n\n", report.read_text(encoding="utf-8"))
 
     def test_summarize_runs_counts_recurrence(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -919,6 +938,21 @@ status: "needs-review"
             result = self.run_helper(config, "notify", "--send-msmtp", check=False)
             self.assertEqual(result.returncode, 1)
             self.assertIn("AGENT_LEARNING_EMAIL is not configured", result.stderr)
+
+    def test_send_msmtp_supplies_from_header_for_envelope_discovery(self) -> None:
+        module = load_agent_learning_module()
+        with (
+            patch.object(module.shutil, "which", return_value="/usr/local/bin/msmtp"),
+            patch.object(module.subprocess, "run") as run,
+        ):
+            module.send_msmtp("reviewer@example.test", "Review needed", "One note")
+
+        self.assertEqual(run.call_args.args[0], ["msmtp", "--read-envelope-from", "-t"])
+        self.assertEqual(
+            run.call_args.kwargs["input"],
+            "From: reviewer@example.test\nTo: reviewer@example.test\n"
+            "Subject: Review needed\n\nOne note\n",
+        )
 
     def test_hook_review_skills_only_updates_detected_review_skills(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

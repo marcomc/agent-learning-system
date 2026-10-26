@@ -13,6 +13,9 @@ EMAIL="${DEFAULT_EMAIL}"
 EMAIL_PROVIDER="gmail"
 SKILL_MODE="copy"
 INSTALL_AUTOMATIONS="1"
+AUTONOMOUS_REVIEW="0"
+REVIEW_GROUP_THRESHOLD="8"
+VALIDATE_ONLY="0"
 MARKDOWN_LIST=""
 
 cleanup() {
@@ -24,7 +27,7 @@ cleanup() {
 trap cleanup EXIT
 
 usage() {
-  printf '%s\n' "Usage: $0 [--dir PATH] [--vault PATH] [--email ADDRESS] [--email-provider gmail|msmtp] [--skip-automations]"
+  printf '%s\n' "Usage: $0 [--dir PATH] [--vault PATH] [--email ADDRESS] [--email-provider gmail|msmtp] [--autonomous-review|--manual-review] [--review-group-threshold N] [--skip-automations] [--validate-only]"
 }
 
 validate_project() {
@@ -77,6 +80,22 @@ while [[ $# -gt 0 ]]; do
       INSTALL_AUTOMATIONS="0"
       shift
       ;;
+    --autonomous-review)
+      AUTONOMOUS_REVIEW="1"
+      shift
+      ;;
+    --validate-only)
+      VALIDATE_ONLY="1"
+      shift
+      ;;
+    --manual-review)
+      AUTONOMOUS_REVIEW="0"
+      shift
+      ;;
+    --review-group-threshold)
+      REVIEW_GROUP_THRESHOLD=${2:-}
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -88,6 +107,16 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ ! "${REVIEW_GROUP_THRESHOLD}" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' "--review-group-threshold must be a positive integer." >&2
+  exit 2
+fi
+
+if [[ "${VALIDATE_ONLY}" == "1" ]]; then
+  validate_project
+  exit 0
+fi
 
 if [[ "${EMAIL_PROVIDER}" != "gmail" && "${EMAIL_PROVIDER}" != "msmtp" ]]; then
   printf 'Unsupported --email-provider: %s\n' "${EMAIL_PROVIDER}" >&2
@@ -141,6 +170,8 @@ skill_mode_value=$(quote_env "${SKILL_MODE}")
   printf 'AGENT_LEARNING_EMAIL=%s\n' "${email_value}"
   printf 'AGENT_LEARNING_EMAIL_PROVIDER=%s\n' "${email_provider_value}"
   printf 'AGENT_LEARNING_SKILL_MODE=%s\n' "${skill_mode_value}"
+  printf 'AGENT_LEARNING_AUTONOMOUS_REVIEW="%s"\n' "${AUTONOMOUS_REVIEW}"
+  printf 'AGENT_LEARNING_REVIEW_GROUP_THRESHOLD="%s"\n' "${REVIEW_GROUP_THRESHOLD}"
 } > "${CONFIG_FILE}"
 
 python3 "${SCRIPT_DIR}/scripts/agent_learning.py" --config "${CONFIG_FILE}" init-store >/dev/null
@@ -283,8 +314,6 @@ write_automation() {
 }
 
 install_automations() {
-  local global_agents_file
-  local markdownlint_config
   local midnight_prompt
   local morning_prompt
   local noon_prompt
@@ -294,12 +323,11 @@ install_automations() {
     return 0
   fi
 
-  global_agents_file="${HOME}/AGENTS.md"
-  markdownlint_config="${HOME}/.markdownlint.json"
-
-  midnight_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the consolidate-agent-learnings skill. Process new Obsidian notes from inbox and reviewed notes from needs-review. Promote only safe, grounded, reusable lessons into ${global_agents_file}, the smallest relevant reusable skill, the touched project AGENTS.md, and the existing agent-template mining workflow when useful. Move processed notes to processed/YYYY/MM or needs-review as appropriate, write a report, validate changed Markdown with ${markdownlint_config}, validate changed shell scripts with shellcheck --enable=all, and do not commit or push."
   morning_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Check the configured AI Agent Learnings/needs-review directory. If there are no pending or ambiguous review notes, do nothing and do not send email. If the configured recipient is empty or still uses an example.com, example.org, example.net, or example.test placeholder, do not send email; report that ./install.sh --email ADDRESS must be run first. If there are pending or ambiguous review notes and the recipient is configured, send one concise email with count, note paths, project paths, and review reasons. Prefer the Gmail connector if available. If Gmail is unavailable, use python3 scripts/agent_learning.py notify --send-msmtp as the msmtp fallback. Do not modify learning notes from this automation."
-  noon_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the consolidate-agent-learnings skill. Process new inbox notes and automatically reprocess needs-review notes where exactly one Review Decision checkbox is selected. Leave unchecked or ambiguous notes pending. Do not reread processed history except for a specific duplicate or conflict. Promote only safe, grounded, reusable lessons into bounded targets, write a report, validate changed Markdown and shell files, and do not commit or push."
+  noon_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the installed consolidate-agent-learnings skill, including its Joint Review workflow. Run prepare-run and inspect review_analysis; at its configured threshold (default 8 pending notes), reassess related pending notes together using their combined evidence. Honor explicit human decisions. When autonomous instruction review is enabled, resolve grounded technical or already-covered notes with saved review receipts and finalize-note --review-evidence plus --enforce-routing; leave genuine user choices or unresolved evidence pending and consolidate their questions. Promote instructions only, preserve unrelated edits, validate changed files, write a report, and do not commit or push. Do not reread all processed history."
+  midnight_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the installed consolidate-agent-learnings skill, including Joint Review. Process inbox and explicit review decisions, then inspect prepare-run review_analysis and reassess related pending notes jointly at the configured threshold (default 8). If autonomous instruction review is enabled, resolve evidence-backed technical or already-covered notes with a saved receipt and finalize-note --review-evidence --enforce-routing. Keep product, security and operational choices with the user; group residual questions. Preserve unrelated work, change only bounded instruction targets, validate Markdown and shell changes, write a report, and do not commit or push."
+  noon_prompt+=" Re-run prepare-run after inbox processing; follow the skill's target-overlap checks and write-report --review-evidence completion gate for a due residual queue."
+  midnight_prompt+=" Re-run prepare-run after inbox processing; follow the skill's target-overlap checks and write-report --review-evidence completion gate for a due residual queue."
 
   write_automation \
     "agent-learning-midnight-consolidation" \

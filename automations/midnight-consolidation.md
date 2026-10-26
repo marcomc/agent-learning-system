@@ -11,6 +11,19 @@ Process new Obsidian learning notes from `inbox/` and reviewed notes from
 - the touched project's `AGENTS.md`;
 - ignored template-upstream drafts when reusable atom changes are useful.
 
+Inspect `prepare-run.review_analysis` and follow the skill's Joint Review
+workflow when the configured threshold is reached (default eight pending notes).
+Compare related full notes for complementary evidence; grouping is not approval.
+When delegated autonomous instruction review is enabled, resolve verified
+technical or already-covered notes with a saved receipt and
+`finalize-note --review-evidence --enforce-routing`. Honor explicit human
+decisions and preserve ambiguous boxes. Investigate technical uncertainty and
+group only real residual user choices; leave them pending. Avoid re-reading an
+unchanged unresolved cohort without new evidence, target state or user input.
+Re-run `prepare-run` after inbox processing. Follow the skill's exact target
+overlap checks for dirty/untracked projects and its residual-receipt completion
+gate; compare current target hashes before reusing a previous deferral.
+
 Do not commit or push. Write a consolidation report and validate every changed
 Markdown or shell file. Finalize promoted notes with routing metadata and
 `--enforce-routing`. For detection-only lessons, use

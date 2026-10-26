@@ -22,6 +22,12 @@ The full pipeline needs both repositories:
 | `${HOME}/Development/agent-learning-system` | Record notes, consolidate reviews, route prevention targets, create template drafts, audit installed rules |
 | `${HOME}/Development/agents-file-templates-and-skills` | Review approved drafts, update curated atoms, report projects that need refreshed generated instructions |
 
+This two-repository runbook is the core learning pipeline. The general skills
+repository and skills installer participate through skill hooks, source
+ownership, installation, and fanout. See the canonical
+[four-project ecosystem architecture](agent-ecosystem-architecture.md) for
+those boundaries and improvement proposals.
+
 Use `${HOME}` in prompts and docs. The Codex scheduler may store resolved local
 workspace paths internally, but repository documentation must not hard-code a
 personal home path.
@@ -124,6 +130,13 @@ should create or update explicitly if missing.
 
 6. Ensure the template weekly job keeps curated edits gated:
 
+   The midnight and noon jobs must also follow Joint Review from the installed
+   consolidation skill: `prepare-run` triggers a queue-level reassessment at
+   eight pending notes by default. Autonomous technical resolution requires
+   explicit configuration opt-in and source/target hash receipts; human choices
+   and ambiguous checkboxes retain precedence. Preserve this contract when
+   updating an existing scheduler prompt, not just when creating new jobs.
+
    ```text
    summary -> inspect drafts -> dry run approved clean drafts -> apply ->
    validate -> out-of-sync report
@@ -139,7 +152,7 @@ After setup, verify the learning side:
 ```bash
 cd "${HOME}/Development/agent-learning-system"
 python3 scripts/agent_learning.py init-store
-python3 scripts/agent_learning.py prepare-run --json
+python3 scripts/agent_learning.py prepare-run
 markdownlint --config "${HOME}/.markdownlint.json" \
   AGENTS.md CHANGELOG.md README.md docs/*.md skills/**/*.md automations/*.md
 shellcheck --enable=all install.sh

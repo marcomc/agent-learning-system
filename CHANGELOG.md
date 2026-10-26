@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 The project follows semantic versioning.
 
+## [1.1.0] - 2026-10-26
+
+### Added
+
+- Joint review discovery at eight pending notes by default, with configurable
+  trigger, cohort fingerprints, context hints and explicit human precedence.
+- Opt-in instruction-only autonomous resolution with source/target hash
+  receipts, technical/covered classifications and auditable archive metadata.
+- Regressions for threshold boundaries, stale or foreign evidence, unresolved
+  choices, protected human decisions and installer preflight failures.
+- Document the four-project agent ecosystem, source-ownership contract,
+  installation boundaries, architecture weak points, and phased improvements.
+
+### Fixed
+
+- Require per-note residual evidence before reporting a due autonomous Joint
+  Review complete; reject missing coverage, unfinalized technical decisions and
+  stale target snapshots. Reassess dirty/untracked instruction overlap within
+  the same run instead of carrying blanket deferrals forward.
+- Recognize project `docs/agent-procedures.md` as an instruction target only
+  when the project's root `AGENTS.md` explicitly loads that path.
+- Correct the automation validation example to use plain `prepare-run`, which
+  already emits JSON.
+
 ## [1.0.0] - 2026-06-06
 
 ### Added in 1.0.0

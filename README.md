@@ -10,7 +10,9 @@ reusable lessons into agent instructions and review skills.
 - [Repository Layout](#repository-layout)
 - [Install](#install)
 - [Full Pipeline Setup](#full-pipeline-setup)
+- [Four-Project Ecosystem](#four-project-ecosystem)
 - [Learning Store](#learning-store)
+- [Joint Review and Delegated Resolution](#joint-review-and-delegated-resolution)
 - [Instruction and Skill Context](#instruction-and-skill-context)
 - [Conflict Detection Levels](#conflict-detection-levels)
 - [Architecture](#architecture)
@@ -25,7 +27,8 @@ The system keeps learning lightweight and auditable:
 
 - session-level findings are recorded as Obsidian notes;
 - processed notes are kept as history, not deleted;
-- daily consolidation reads only new inbox notes and review decisions;
+- daily consolidation reads new inbox notes, review decisions and related
+  pending cohorts when joint review is due;
 - reusable lessons are promoted to the smallest useful target;
 - no repository is committed or pushed automatically.
 
@@ -45,6 +48,7 @@ The system keeps learning lightweight and auditable:
 │   ├── template-weekly-upstream-apply.md
 │   └── weekly-rule-audit.md
 ├── docs/
+│   ├── agent-ecosystem-architecture.md
 │   ├── auto-learning-pipeline-automations.md
 │   └── composable-learning-architecture.md
 ├── scripts/
@@ -132,6 +136,16 @@ covers:
 | Approved template draft apply | `agents-file-templates-and-skills` |
 | Generated-project refresh reports | `agents-file-templates-and-skills` |
 
+## Four-Project Ecosystem
+
+The learning and template repositories form the core auto-learning pipeline,
+but they operate inside a broader ecosystem that also includes the general
+`skills` content repository and `skills-installer` distribution wrapper.
+
+The canonical architecture, source-ownership contract, identified weak points,
+and phased improvement proposal are documented in
+[`docs/agent-ecosystem-architecture.md`](docs/agent-ecosystem-architecture.md).
+
 ## Learning Store
 
 The canonical archive lives under `AGENT_LEARNING_DIR` plus
@@ -163,6 +177,14 @@ Obsidian vault, Obsidian sees the generated Markdown files as normal notes.
 > `finalize-note`, `write-report`, `summarize-runs`, and
 > `create-template-draft`.
 
+Joint Review is evaluated by the noon and midnight consolidations when at
+least eight notes are pending by default; it is not an event-driven execution
+at note capture. With delegated review enabled, dirty/untracked projects need
+an exact instruction-overlap check, not blanket deferral. If the queue remains
+due, `write-report --review-evidence PATH` requires a saved per-note residual
+receipt with actual user choices or scoped investigation blockers and current
+target hashes. Resolved technical notes must be finalized first.
+
 ```mermaid
 flowchart LR
   accTitle: Agent learning lifecycle
@@ -174,7 +196,10 @@ flowchart LR
   classify -->|Yes| promote["Promote to bounded targets"]
   classify -->|No| review["Move to needs-review"]
   review --> decide{"One review box checked?"}
-  decide -->|No| wait["Leave note pending"]
+  decide -->|No| joint["Joint review when due"]
+  joint --> authority{"Delegated technical resolution?"}
+  authority -->|Verified instruction-only lesson| finalize
+  authority -->|Missing evidence or user choice| wait["Retain pending; group residual questions"]
   decide -->|Yes| finalize["Process reviewed decision"]
   promote --> archive["Archive processed note"]
   finalize --> archive
@@ -196,6 +221,40 @@ Review notes contain a stable checkbox block:
 The consolidator reads `inbox/`, `needs-review/`, and `state/processed.json`.
 It does not reread `processed/` history unless resolving a duplicate or
 conflict.
+
+## Joint Review and Delegated Resolution
+
+Pending notes are reassessed together at **eight notes by default**. This is a
+queue trigger, not a minimum subgroup size: a smaller complementary set may
+already resolve uncertainty. `prepare-run.review_analysis` exposes the count,
+threshold, cohort fingerprint, candidate project contexts and human precedence.
+The agent reads full notes and compares evidence; shared labels alone never
+authorize promotion.
+
+Autonomous resolution is opt-in for new installations:
+
+```bash
+./install.sh --dir <LEARNING_BASE> --email <RECIPIENT_ADDRESS> \
+  --autonomous-review --review-group-threshold 8
+```
+
+Configuration keys are `AGENT_LEARNING_AUTONOMOUS_REVIEW` (`0` or `1`, default
+`0`) and `AGENT_LEARNING_REVIEW_GROUP_THRESHOLD` (positive integer, default `8`).
+Manual mode retains human review. With delegated authority, the agent may apply
+verified technical instruction changes or archive already-covered lessons;
+technical uncertainty is investigated, and unresolved user choices remain pending.
+Preserve existing unrelated changes and distinguish historical routing blockers
+from current target state. Application code, live systems and external actions
+are outside this delegation.
+
+Each autonomous finalization requires an immutable JSON receipt in the
+configured store's `reports/`, passed through `finalize-note --review-evidence`
+with `--enforce-routing`. The helper verifies source/target hashes, instruction
+scope, classification and absence of open choices; explicit human selections
+and ambiguous checkbox blocks take precedence. It records delegated authority
+without checking a human approval box. See the
+[Joint Review contract](skills/consolidate-agent-learnings/references/joint-review.md)
+for the receipt schema, validation and grouped-question workflow.
 
 ## Instruction and Skill Context
 

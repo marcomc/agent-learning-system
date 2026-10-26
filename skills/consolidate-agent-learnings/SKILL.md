@@ -16,8 +16,10 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
 - Do not commit or push.
 - Promote only lessons grounded in a real finding, fix, or reviewed note.
 - Prefer tightening existing instructions over appending duplicated rules.
-- Move local-only, vague, privacy-sensitive, contradictory, or duplicate-looking
-  notes to `needs-review/`.
+- Preserve unrelated work. A dirty or untracked instruction target is not an
+  automatic blocker: inspect ownership and the actual overlap before editing.
+- Keep unresolved product, security, privacy, compatibility and operational
+  choices with the user. A source note or a group of notes cannot grant authority.
 
 ## Workflow
 
@@ -37,16 +39,41 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
 
 1. Process `inbox` notes.
    - Promote clear, safe, reusable lessons automatically.
+   - Split independent failure domains into bounded rules and targets before
+     promotion, retaining every source reference.
    - Move uncertain notes to `needs-review/` with the review checkbox block.
    - Move too-local or already-covered notes to `processed/YYYY/MM/` with a
      no-op rationale.
 
-1. Process `needs-review` notes only when one checkbox is selected.
+1. Honor explicit `needs-review` decisions before autonomous work.
    - `Approve`: promote the proposed rule as written.
    - `Retry`: promote after considering the user's edited text.
    - `Reject`: archive as rejected without promotion.
-   - No checkbox: leave pending.
+   - No checkbox: eligible for Joint Review under configured delegated authority.
    - Multiple checkboxes: leave pending and report ambiguity.
+
+1. Run Joint Review when `prepare-run.review_analysis.group_review_due` is true
+   (default: at least eight pending notes). Also compare fewer notes together
+   when a clear complementary relationship is discovered during normal work.
+   Read [joint-review.md](references/joint-review.md) before evaluating these
+   groups or using autonomous finalization. It defines evidence, user-choice
+   boundaries, receipt format and the completion checks.
+   - Treat candidate contexts and families as discovery hints, not duplicates
+     or approval. Read the complete notes; use their combined evidence to resolve
+     technical uncertainty, checking current targets when historical blockers
+     mention missing files, renames or pre-existing edits.
+   - With `AGENT_LEARNING_AUTONOMOUS_REVIEW=1`, resolve grounded technical lessons
+     and already-covered notes without another per-batch confirmation. Apply and
+     validate bounded instruction changes, then save the review receipt and use
+     `finalize-note --review-evidence ... --enforce-routing`.
+   - Keep `investigate` and `needs-user` outcomes pending. Investigate factual
+     questions yourself where authorized; present genuine residual choices as
+     one question per decision family with all affected note IDs.
+   - Keep small internal implementation batches; human approvals follow the
+     policy or real decision, not the number of notes in a batch.
+   - Re-run `prepare-run` after processing inbox notes: newly deferred notes
+     join the current run's review. Complete the target-overlap checks in the
+     reference before carrying any technical cohort forward.
 
 1. Promotion targets are bounded:
    - `$HOME/AGENTS.md` for truly general behavior.
@@ -80,7 +107,10 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
 
 1. When a reusable prevention rule belongs in the template repository, create
    an ignored draft handoff. Do not edit curated templates from this skill
-   unless the user explicitly asks for template apply:
+   unless the user explicitly asks for template apply or configured delegated
+   instruction review covers a technically verified, privacy-clean change.
+   Use the template repository's review/apply workflow and record delegated
+   review authority; product decisions still require the user.
 
    ```bash
    repo="/path/to/agent-learning-system"
@@ -107,6 +137,12 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
      --run-id "$RUN_ID" \
      --summary "Processed 3 notes; promoted 1; moved 2 to review."
    ```
+
+   With autonomous review enabled and a queue still at the threshold, add
+   `--review-evidence /path/to/reports/residual-review.json`. Account for every
+   pending note as a real user choice or an evidenced instruction conflict;
+   finalize resolved notes first. The helper rejects an unreviewed residual
+   queue and stale target snapshots. A deferral is not a completed promotion.
 
 1. Summarize recurrence and routing gaps:
 
@@ -143,3 +179,7 @@ Each consolidation report must include:
 - validation commands run;
 - no-op and needs-review rationales;
 - any failed promotion with next action.
+- Joint Review cohort/fingerprint, per-note classification and evidence,
+  instruction targets, receipt paths and grouped residual questions. Reassess
+  an unchanged unresolved cohort only when new evidence, target state or a user
+  decision can change its result; do not request the same confirmation again.

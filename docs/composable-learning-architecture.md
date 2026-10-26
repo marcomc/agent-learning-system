@@ -22,6 +22,10 @@ rules.
 The system must promote each real lesson to the place where it can prevent the
 same class of mistake before the agent repeats it.
 
+This document defines learning-specific routing. The broader repository,
+installation, and source-ownership boundaries are documented in the
+[four-project ecosystem architecture](agent-ecosystem-architecture.md).
+
 ```text
 Wrong question: Where can this lesson be documented?
 Right question: Where must this lesson live so the failing agent would read it
@@ -79,7 +83,7 @@ Would the agent that made the mistake have read the promoted rule before acting?
 | Template atom | Reusable project-type or task rule | Similar projects should inherit the rule |
 | Project `AGENTS.md` | Repo-specific facts and commands | The rule depends on one project |
 | Reusable skill | Detection, review, remediation, or workflow behavior | The rule changes how a skill works |
-| `needs-review/` | Human decision point | The rule is broad, risky, conflicting, or privacy-sensitive |
+| `needs-review/` | Technical reassessment or human decision | Evidence or routing is incomplete, or a real choice remains |
 
 Do not treat a review-skill update as prevention unless the failing agent would
 normally load that skill before acting.

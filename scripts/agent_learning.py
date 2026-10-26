@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -698,6 +699,48 @@ def note_summary(path: Path) -> dict[str, str]:
         "review_decision": decision,
         "checked": ", ".join(checked),
         "review_reason": fm.get("review_reason", ""),
+        "lesson_family": fm.get("lesson_family", ""),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def review_policy(config: dict[str, str]) -> dict[str, Any]:
+    enabled = config.get("AGENT_LEARNING_AUTONOMOUS_REVIEW", "0").strip()
+    if enabled not in {"0", "1"}:
+        raise ConfigError("AGENT_LEARNING_AUTONOMOUS_REVIEW must be 0 or 1.")
+    try:
+        threshold = int(config.get("AGENT_LEARNING_REVIEW_GROUP_THRESHOLD", "8"))
+    except ValueError as exc:
+        raise ConfigError("AGENT_LEARNING_REVIEW_GROUP_THRESHOLD must be a positive integer.") from exc
+    if threshold < 1:
+        raise ConfigError("AGENT_LEARNING_REVIEW_GROUP_THRESHOLD must be a positive integer.")
+    return {"autonomous_instructions": enabled == "1", "group_threshold": threshold}
+
+
+def review_analysis(config: dict[str, str], notes: list[dict[str, str]]) -> dict[str, Any]:
+    policy = review_policy(config)
+    pending = [note for note in notes if note["review_decision"] in {"pending", "ambiguous"}]
+    contexts: dict[str, list[dict[str, str]]] = {}
+    for note in pending:
+        project = note["project_path"].strip()
+        context = str(Path(project).expanduser().resolve()) if project else "unknown-project"
+        contexts.setdefault(context, []).append(note)
+    fingerprint = hashlib.sha256(
+        json.dumps(sorted((note["id"], note["sha256"]) for note in pending)).encode()
+    ).hexdigest()
+    return {
+        **policy,
+        "pending_count": len(pending),
+        "group_review_due": len(pending) >= policy["group_threshold"],
+        "fingerprint": fingerprint,
+        "candidate_contexts": [
+            {"project_path": context, "count": len(members), "note_ids": [n["id"] for n in members],
+             "lesson_families": sorted({n["lesson_family"] for n in members if n["lesson_family"]})}
+            for context, members in sorted(contexts.items())
+        ],
+        "autonomous_candidates": [n["id"] for n in pending if n["review_decision"] == "pending"],
+        "human_precedence": [n["id"] for n in notes if n["review_decision"] != "pending"],
+        "notice": "Contexts and shared families are discovery hints, not approval or proof of equivalence. Read full notes and compare evidence before deciding.",
     }
 
 
@@ -712,6 +755,7 @@ def command_prepare_run(args: argparse.Namespace) -> int:
         "learning_root": str(root),
         "inbox": inbox,
         "needs_review": review,
+        "review_analysis": review_analysis(config, review),
     }
     print(json.dumps(payload, indent=2))
     return 0
@@ -737,6 +781,120 @@ def update_processed_state(root: Path, note_id: str, entry: dict[str, Any]) -> N
         state = load_state(root)
         state.setdefault("processed", {})[note_id] = entry
         save_state(root, state)
+
+
+def instruction_target(path: Path, root: Path) -> bool:
+    if path.is_relative_to(root.resolve()) or path.suffix != ".md":
+        return False
+    if path.name in {"AGENTS.md", "CLAUDE.md", "GEMINI.md", "SKILL.md", "copilot-instructions.md"}:
+        return True
+    if path.name.endswith(".instructions.md"):
+        return True
+    if path.name == "agent-procedures.md" and path.parent.name == "docs":
+        project_rules = path.parent.parent / "AGENTS.md"
+        return project_rules.is_file() and "docs/agent-procedures.md" in project_rules.read_text(encoding="utf-8")
+    return any(
+        parent.name == "references" and (parent.parent / "SKILL.md").is_file()
+        for parent in path.parents
+    )
+
+
+def validate_autonomous_review(
+    config: dict[str, str], root: Path, source: Path, note_id: str,
+    body: str, args: argparse.Namespace, state: dict[str, Any],
+) -> dict[str, str]:
+    """Check delegated authority and receipt integrity, not semantic truth."""
+    if not review_policy(config)["autonomous_instructions"]:
+        raise ConfigError("Autonomous review requires explicit AGENT_LEARNING_AUTONOMOUS_REVIEW=1 authorization.")
+    if source.parent.resolve() != (root / "needs-review").resolve():
+        raise ConfigError("Autonomous review only finalizes configured needs-review notes.")
+    if args.status != "processed" or not args.enforce_routing:
+        raise ConfigError("Autonomous review requires --status processed and --enforce-routing.")
+    if checkbox_decision(body)[0] != "pending":
+        raise ConfigError("Explicit or ambiguous human review decisions take precedence.")
+    receipt = Path(args.review_evidence).expanduser().resolve()
+    reports = (root / "reports").resolve()
+    if not receipt.is_relative_to(reports) or not receipt.is_file():
+        raise ConfigError("Review evidence must be a saved JSON receipt inside configured reports.")
+    raw = receipt.read_bytes()
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ConfigError("Invalid autonomous review receipt JSON.") from exc
+    if not isinstance(data, dict) or data.get("version") != 1 or data.get("scope") != "instructions-only":
+        raise ConfigError("Review receipt requires version 1 and scope instructions-only.")
+    snapshots = data.get("sources")
+    decisions = data.get("decisions")
+    if not isinstance(snapshots, list) or len(snapshots) < 2 or not isinstance(decisions, list):
+        raise ConfigError("Joint review requires at least two source snapshots and a decision list.")
+    digest = hashlib.sha256(raw).hexdigest()
+    source_ids: set[str] = set()
+    source_paths: set[Path] = set()
+    selected_snapshot = None
+    for item in snapshots:
+        if not isinstance(item, dict) or not all(isinstance(item.get(k), str) and item[k].strip() for k in ("id", "path", "sha256")):
+            raise ConfigError("Each source snapshot requires id, path and sha256.")
+        path = Path(item["path"]).expanduser().resolve()
+        if path.parent != (root / "needs-review").resolve() or path.suffix != ".md":
+            raise ConfigError("Review source snapshot is outside configured needs-review.")
+        if item["id"] in source_ids or path in source_paths:
+            raise ConfigError("Review source snapshots must have unique IDs and paths.")
+        source_ids.add(item["id"])
+        source_paths.add(path)
+        if path.exists():
+            fm, _ = read_note(path)
+            if fm.get("id", path.stem) != item["id"] or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+                raise ConfigError("Stale or mismatched review source snapshot.")
+        else:
+            entry = state.get("processed", {}).get(item["id"], {})
+            archived = Path(entry.get("path", "")).resolve()
+            if (entry.get("status") != "processed" or entry.get("review_receipt_sha256") != digest
+                    or entry.get("review_source_sha256") != item["sha256"]
+                    or not archived.is_relative_to((root / "processed").resolve()) or not archived.is_file()
+                    or hashlib.sha256(archived.read_bytes()).hexdigest() != entry.get("review_archive_sha256")):
+                raise ConfigError("A joint source is missing without a matching archive receipt.")
+        if path == source and item["id"] == note_id:
+            selected_snapshot = item
+    if selected_snapshot is None:
+        raise ConfigError("Current note is absent from review source snapshots.")
+    matching = [d for d in decisions if isinstance(d, dict) and d.get("note_id") == note_id]
+    if len(matching) != 1:
+        raise ConfigError("Exactly one autonomous decision is required for the current note.")
+    decision = matching[0]
+    if decision.get("classification") not in {"technical", "already-covered"}:
+        raise ConfigError("Only technical or already-covered decisions can be archived autonomously.")
+    if decision.get("open_choices") != []:
+        raise ConfigError("Unresolved user choices prohibit autonomous archival.")
+    evidence = decision.get("evidence_refs")
+    if (not isinstance(evidence, list) or note_id not in evidence
+            or any(not isinstance(ref, str) or ref not in source_ids for ref in evidence)):
+        raise ConfigError("Decision evidence must reference known sources including the current note.")
+    if not isinstance(decision.get("rationale"), str) or not decision["rationale"].strip():
+        raise ConfigError("Autonomous decision requires a grounded rationale.")
+    targets = decision.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise ConfigError("Autonomous decision requires verified instruction targets.")
+    verified_targets: set[Path] = set()
+    for target in targets:
+        if not isinstance(target, dict) or not isinstance(target.get("path"), str):
+            raise ConfigError("Each instruction target requires path and sha256.")
+        path = Path(target["path"]).expanduser().resolve()
+        if not instruction_target(path, root) or not path.is_file():
+            raise ConfigError("Autonomous target must be an instruction Markdown file outside the learning store.")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != target.get("sha256"):
+            raise ConfigError("Stale instruction target in autonomous review receipt.")
+        verified_targets.add(path)
+    for value in (args.prevention_target or []) + (args.detection_target or []):
+        path = Path(value).expanduser()
+        if path.is_absolute() and path.resolve() not in verified_targets:
+            raise ConfigError("Concrete routing targets must match verified receipt targets.")
+    return {
+        "review_authority": "autonomous-instructions",
+        "review_classification": decision["classification"],
+        "review_receipt": str(receipt),
+        "review_receipt_sha256": digest,
+        "review_source_sha256": selected_snapshot["sha256"],
+    }
 
 
 def command_finalize_note(args: argparse.Namespace) -> int:
@@ -772,6 +930,12 @@ def command_finalize_note(args: argparse.Namespace) -> int:
     final = dest
     with state_update_lock(root):
         state = load_state(root)
+        review_metadata: dict[str, str] = {}
+        if args.review_evidence:
+            if source.read_text(encoding="utf-8") != original_text:
+                raise ConfigError("Review source changed while waiting for finalization.")
+            review_metadata = validate_autonomous_review(config, root, source, note_id, body, args, state)
+            fm.update(review_metadata)
         dest.parent.mkdir(parents=True, exist_ok=True)
         write_note(source, fm, body)
         if source == dest.resolve():
@@ -788,7 +952,10 @@ def command_finalize_note(args: argparse.Namespace) -> int:
                 "processed_at": fm["processed_at"],
                 "rationale": args.rationale,
                 **routing_state_payload(routing),
+                **review_metadata,
             }
+            if review_metadata:
+                state["processed"][note_id]["review_archive_sha256"] = hashlib.sha256(final.read_bytes()).hexdigest()
             save_state(root, state)
         except Exception:
             if moved and final.exists() and not source.exists():
@@ -800,10 +967,67 @@ def command_finalize_note(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_residual_review(root: Path, notes: list[dict[str, str]], evidence: str) -> dict[str, int]:
+    """Require an accounted-for residual queue; semantic judgments remain with the reviewer."""
+    receipt = Path(evidence).expanduser().resolve()
+    if not receipt.is_relative_to((root / "reports").resolve()) or not receipt.is_file():
+        raise ConfigError("Review evidence must be a saved JSON receipt inside configured reports.")
+    try:
+        data = json.loads(receipt.read_bytes())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ConfigError("Invalid residual review JSON.") from exc
+    if (not isinstance(data, dict) or data.get("version") != 1 or data.get("scope") != "instructions-only"
+            or not isinstance(data.get("sources"), list) or not isinstance(data.get("decisions"), list)):
+        raise ConfigError("Residual review requires a version 1 instructions-only receipt with sources and decisions.")
+    counts: dict[str, int] = {}
+    for note in notes:
+        if note["review_decision"] not in {"pending", "ambiguous"}:
+            continue
+        snapshots = [s for s in data["sources"] if isinstance(s, dict) and s.get("id") == note["id"]]
+        decisions = [d for d in data["decisions"] if isinstance(d, dict) and d.get("note_id") == note["id"]]
+        if len(snapshots) != 1 or len(decisions) != 1:
+            raise ConfigError("Every pending note requires exactly one source snapshot and residual decision.")
+        snapshot, decision = snapshots[0], decisions[0]
+        if snapshot.get("path") != note["path"] or snapshot.get("sha256") != note["sha256"]:
+            raise ConfigError("Stale residual review source snapshot; reassess the changed note.")
+        if not isinstance(decision.get("rationale"), str) or not decision["rationale"].strip():
+            raise ConfigError("Residual decision requires a grounded rationale.")
+        classification = decision.get("classification")
+        if classification == "needs-user":
+            choices = decision.get("open_choices")
+            if not isinstance(choices, list) or not choices or any(not isinstance(c, str) or not c.strip() for c in choices):
+                raise ConfigError("needs-user residuals require an answerable open choice.")
+        elif classification == "investigate":
+            blocker = decision.get("blocker")
+            targets = decision.get("targets")
+            if (not isinstance(blocker, dict)
+                    or any(not isinstance(blocker.get(k), str) or not blocker[k].strip() for k in ("overlap", "next_action"))
+                    or not isinstance(targets, list) or not targets):
+                raise ConfigError("Investigate requires exact instruction overlap, next action and target snapshots; dirty status alone is insufficient.")
+            for target in targets:
+                if not isinstance(target, dict) or not isinstance(target.get("path"), str):
+                    raise ConfigError("Residual target requires path and sha256.")
+                path = Path(target["path"]).expanduser().resolve()
+                if not path.is_file() or not instruction_target(path, root):
+                    raise ConfigError("Residual target must be an existing instruction file outside the learning store.")
+                if hashlib.sha256(path.read_bytes()).hexdigest() != target.get("sha256"):
+                    raise ConfigError("Stale residual instruction target; reassess ownership and exact overlap.")
+        else:
+            raise ConfigError("Finalize resolved technical notes before reporting; pending notes need investigate or needs-user decisions.")
+        counts[classification] = counts.get(classification, 0) + 1
+    return counts
+
+
 def command_write_report(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
     ensure_store(root)
+    review = [note_summary(path) for path in sorted((root / "needs-review").glob("*.md"))]
+    analysis = review_analysis(config, review)
+    evidence = args.review_evidence
+    if analysis["group_review_due"] and analysis["autonomous_instructions"] and not evidence:
+        raise ConfigError("Joint review is due: finalize resolved notes or supply --review-evidence accounting for every residual note.")
+    residuals = validate_residual_review(root, review, evidence) if evidence else {}
     run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
     path = unique_path(root / "reports" / f"{run_id}.md")
     routing_section = ""
@@ -811,19 +1035,24 @@ def command_write_report(args: argparse.Namespace) -> int:
         routing = routing_from_args(args, {}, "", Path(f"{run_id}.md"))
         if args.enforce_routing:
             enforce_routing_contract(routing)
-        routing_section = "\n" + routing_markdown(routing)
-    body = textwrap.dedent(
-        f"""\
-        # Agent Learning Consolidation {run_id}
-
-        - Generated: {now_iso()}
-
-        ## Summary
-
-        {args.summary.strip()}
-        {routing_section}
-        """
-    )
+        routing_section = routing_markdown(routing)
+    lines = [
+        f"# Agent Learning Consolidation {run_id}",
+        "",
+        f"- Generated: {now_iso()}",
+        f"- Queue: inbox={len(list((root / 'inbox').glob('*.md')))}, pending-review={analysis['pending_count']}.",
+        f"- Joint review threshold: {analysis['group_threshold']}; due: {str(analysis['group_review_due']).lower()}.",
+        "",
+        "## Summary",
+        "",
+        args.summary.strip(),
+    ]
+    if routing_section.strip():
+        lines.extend(["", routing_section.strip()])
+    if evidence:
+        lines.extend(["", "## Residual review", "", f"- Receipt: {Path(evidence).expanduser().resolve()}."])
+        lines.extend(f"- {key}: {count}." for key, count in sorted(residuals.items()))
+    body = "\n".join(lines) + "\n"
     path.write_text(body, encoding="utf-8")
     print(path)
     return 0
@@ -1113,7 +1342,7 @@ def notification_body(config: dict[str, str], root: Path) -> tuple[str, str] | N
 def send_msmtp(recipient: str, subject: str, body: str) -> None:
     if not shutil.which("msmtp"):
         raise SystemExit("msmtp is not available; configure Gmail connector or install msmtp.")
-    message = f"To: {recipient}\nSubject: {subject}\n\n{body}\n"
+    message = f"From: {recipient}\nTo: {recipient}\nSubject: {subject}\n\n{body}\n"
     subprocess.run(["msmtp", "--read-envelope-from", "-t"], input=message, text=True, check=True)
 
 
@@ -1459,12 +1688,14 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--status", choices=["processed", "needs-review", "rejected"], required=True)
     finalize.add_argument("--rationale", required=True)
     finalize.add_argument("--run-id", default="")
+    finalize.add_argument("--review-evidence", help="Approved autonomous instruction-only decision receipt under configured reports")
     add_routing_arguments(finalize, include_enforce=True)
     finalize.set_defaults(func=command_finalize_note)
 
     report = sub.add_parser("write-report")
     report.add_argument("--run-id", default="")
     report.add_argument("--summary", required=True)
+    report.add_argument("--review-evidence", help="Saved per-note receipt accounting for a due Joint Review's residual queue")
     add_routing_arguments(report, include_enforce=True)
     report.set_defaults(func=command_write_report)
 

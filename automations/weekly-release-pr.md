@@ -3,17 +3,26 @@
 Run every Monday after the integrated weekly learning cycle. Work only in the configured
 Agent Learning System repository.
 
-First run `python3 scripts/agent_learning.py pipeline-release-status`. It must
+Inspect matching open release PRs before checking for new uncommitted changes.
+Resume an existing release's unfinished review or notification lifecycle even
+when its working tree is clean. If it is already ready for user approval, report
+that state and suppress its email only when a saved provider receipt confirms
+delivery for this same PR/version. Otherwise resume the notification step;
+reconcile an uncertain prior submission with the provider before any retry.
+Save the submission intent and resulting receipt in the release report/chat.
+Only when no
+matching release exists and no eligible changes remain should this run stop.
+
+For a new release:
+
+Run `python3 scripts/agent_learning.py pipeline-release-status` first. It must
 confirm this week's discovery and a verified completed consolidation, including
 post-verification of changed targets. Preserve failure/unknown results as
 pending work. Unrelated unresolved instruction choices do not establish a defect
 in this repository's release; assess its own scoped pre-PR evidence.
 
-If the worktree has no release-eligible changes, report that and stop. Otherwise:
-
-1. Inspect existing release branches and open PRs for this repository. Resume
-   an existing matching release without creating another branch, version or
-   notification. Use `$update-release` to derive the next version and scope from the
+1. Reuse a verified existing release branch where appropriate. Use
+   `$update-release` to derive the next version and scope from the
    authoritative changelog order, current target branch, and all uncommitted
    changes. Update `CHANGELOG.md` with that same version; do not publish a
    release or merge a pull request.

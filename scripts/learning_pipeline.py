@@ -311,9 +311,9 @@ class Pipeline:
             if issue["status"] not in OPEN and not issue.get("revalidation_required"):
                 continue
             sources = issue.get("sources", [])
-            covered.update(ref.get("note_id") for ref in sources)
             if any(ref.get("note_id") and ref["note_id"] not in live for ref in sources):
                 continue  # A source was archived or the user made an explicit checkbox decision.
+            covered.update(ref.get("note_id") for ref in sources)
             stale = issue.get("revalidation_required") or any(not current(ref) for ref in issue.get("targets", []) + sources)
             if stale:
                 item = {"id": issue["id"], "status": "investigate", "title": "Revalidation required",

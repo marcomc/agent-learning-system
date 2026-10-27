@@ -188,6 +188,27 @@ class PipelineTests(unittest.TestCase):
         self.note.write_text(self.note.read_text().replace("[ ] Approve", "[x] Approve"))
         self.assertIsNone(self.pipeline.digest(self.pipeline.status(), self.notes()))
 
+    def test_a_grouped_decision_cannot_hide_remaining_pending_sources(self):
+        original = self.note.read_text()
+        second = self.note.with_name("second.md")
+        second.write_text(original.replace('id: "note-1"', 'id: "note-2"'))
+        for closed in ("approved", "rejected", "archived"):
+            with self.subTest(closed=closed):
+                self.note.write_text(original)
+                issue = self.decision()
+                issue["sources"].append({**self.ref(second), "note_id": "note-2"})
+                self.pipeline.update_issue(issue)
+                if closed == "archived":
+                    self.note.unlink()
+                else:
+                    label = "Approve" if closed == "approved" else "Reject"
+                    self.note.write_text(original.replace("[ ] " + label, "[x] " + label))
+                digest = self.pipeline.digest(self.pipeline.status(), self.notes())
+                self.assertIsNotNone(digest)
+                self.assertEqual(digest["items"][0]["note_ids"], ["note-2"])
+                self.assertEqual(digest["items"][0]["options"], [])
+                self.assertNotIn("Which retention policy", digest["body"])
+
     def test_target_drift_removes_stale_options_and_requires_agent_revalidation(self):
         self.pipeline.update_issue(self.decision())
         self.target.write_text("# Updated instructions\n")

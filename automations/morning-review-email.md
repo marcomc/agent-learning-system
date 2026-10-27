@@ -1,18 +1,16 @@
-# Morning Agent Learning Review Email
+# Morning Agent Learning Digest
 
-Check the configured Obsidian `AI Agent Learnings/needs-review/` directory.
+Read the installed consolidation skill's `references/pipeline.md` delivery
+contract. Use `python3 scripts/agent_learning.py notify` to preview current
+residual decisions and operational failures. Reconcile an existing outbox
+through provider evidence before another send.
 
-If there are no pending review notes, do nothing and do not send email. If
-the configured recipient is empty or still uses an `example.com`,
-`example.org`, `example.net`, or `example.test` placeholder, do not send email.
-If there are pending notes and the recipient is configured, send one concise
-email with the count, note paths, project names, and review reasons.
+Send only when the helper returns a digest and the recipient is configured.
+Each decision includes its description, actual question, described options and
+clickable verified chat link. Preserve the helper's readable HTML and plain-text
+alternative. Prefer a Gmail connector capable of sending both; otherwise use
+the single `notify --send-msmtp` path. Follow the reservation, revalidation and
+receipt commands in the delivery contract.
 
-Prefer the Gmail connector. If Gmail is unavailable, run:
-
-```bash
-repo="/path/to/agent-learning-system"
-python3 "${repo}/scripts/agent_learning.py" notify --send-msmtp
-```
-
-Do not modify learning notes from this automation.
+Keep technical investigation with the agent. Do not alter notes or instructions,
+invent a user choice, send an unformatted line dump or infer email delivery.

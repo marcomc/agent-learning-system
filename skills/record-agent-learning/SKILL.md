@@ -3,6 +3,8 @@ name: record-agent-learning
 description: Use when capturing a real reusable finding, fix, regression, or workflow lesson, or when explicitly asked to install the capture hook into local review skills.
 ---
 
+<!-- MARCOMC-SKILL: owner="MarcoMC <marco@marcomc.com>"; repository="marcomc/skills"; provenance="original" -->
+
 # Record Agent Learning
 
 Use this skill near the end of a session when the work produced a reusable
@@ -13,9 +15,13 @@ Use hook mode only when the user explicitly asks to install, hook, attach, or
 agganciare `record-agent-learning` to review skills. Do not install hooks during
 ordinary one-off learning capture.
 
-This skill's repository copy is the source. `install.sh` installs a copied
-directory under `${HOME}/.agents/skills/record-agent-learning`; do not rely on a
-symlink from the installed skill back to the repository source.
+The owning source is `agent-learning-system/skills/record-agent-learning`;
+the general skills collection carries a distribution mirror. Resolve the helper
+repository from `AGENT_LEARNING_REPO` or the learning system's configured
+`config.env` under `${XDG_CONFIG_HOME:-$HOME/.config}/agent-learning-system`.
+Its installer copies the skill into `${HOME}/.agents/skills`; installed copies
+and collection mirrors do not replace the owning source. A missing external
+helper/store is an unavailable capture capability, not a failed code review.
 
 ## Capture Criteria
 
@@ -35,7 +41,8 @@ ended with no actionable lesson.
 2. Keep the note factual and compact; avoid long transcripts.
 3. Prefer generic failure classes over one-line bug trivia.
 4. Include the project path and source skill or workflow when known.
-5. Use the bundled helper to write the note to Obsidian.
+5. Reuse the run's existing capture, or use the learning-system helper once per
+   project/source-run/lesson-family. Keep independent later occurrences.
 
 Example:
 
@@ -44,6 +51,8 @@ repo="/path/to/agent-learning-system"
 python3 "${repo}/scripts/agent_learning.py" record \
   --project-path "$PWD" \
   --source-skill "scoped-pre-pr-remediation" \
+  --source-run-id "<terminal-run-id>" \
+  --lesson-family "disable-teardown-symmetry" \
   --title "Disabled feature left installer-created privileges behind" \
   --problem "Disabled feature left a helper grant installed." \
   --root-cause "Disable logic skipped persisted install-time artifacts." \
@@ -54,6 +63,18 @@ python3 "${repo}/scripts/agent_learning.py" record \
 ```
 
 For complex text, pass JSON with `--from-json <file>` or `--from-json -`.
+
+The optional source-run identity makes identical retries return the same note,
+including after archival. Different content for that identity needs explicit
+reconciliation; it never silently replaces the original lesson. Report-only
+comparisons and unsupported suggestions create no notes.
+
+Use `--application-status applied --applied-target <file>` (repeatable),
+`--application-evidence <saved-verification-artifact>` and `--verification`
+for an already implemented improvement. The helper records target/evidence
+hashes; these prove identity, not semantic correctness. Consolidation verifies
+current coverage before archival instead of applying it twice. Default
+`proposed` status grants no additional authority for unresolved choices.
 
 ## Hook Mode
 

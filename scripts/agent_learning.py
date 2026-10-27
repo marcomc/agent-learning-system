@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 from contextlib import contextmanager
 import difflib
 import errno
 import hashlib
 import json
+import io
 import os
 import re
 import shutil
@@ -19,8 +21,14 @@ import textwrap
 import time
 import uuid
 from datetime import datetime
+from email.message import EmailMessage
+from email.policy import SMTP
 from pathlib import Path
 from typing import Any
+
+# Support direct CLI execution and file-based imports used by the test harness.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from learning_pipeline import Pipeline, chat_url, snapshot
 
 try:
     import fcntl
@@ -180,11 +188,13 @@ def learning_root(config: dict[str, str]) -> Path:
 
 
 def ensure_store(root: Path) -> None:
-    for rel in ["inbox", "needs-review", "reports", "state"]:
-        (root / rel).mkdir(parents=True, exist_ok=True)
+    directories = [store_directory(root, root / rel) for rel in ["inbox", "needs-review", "reports", "state"]]
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
     state_path = root / "state" / "processed.json"
-    if not state_path.exists():
-        atomic_write_text(state_path, json.dumps({"processed": {}}, indent=2) + "\n")
+    with state_update_lock(root):
+        if not state_path.exists():
+            atomic_write_text(state_path, json.dumps({"processed": {}}, indent=2) + "\n")
 
 
 def slugify(value: str) -> str:
@@ -238,13 +248,20 @@ def is_relative_to(path: Path, base: Path) -> bool:
     return True
 
 
+def store_directory(root: Path, directory: Path) -> Path:
+    resolved = directory.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise ConfigError(f"Learning directory resolves outside configured store: {directory}")
+    return resolved
+
+
 def validate_note_source(root: Path, source: Path) -> Path:
     try:
         resolved_source = source.expanduser().resolve(strict=True)
     except FileNotFoundError as exc:
         raise ConfigError(f"Note file does not exist: {source}") from exc
 
-    allowed_dirs = [(root / dirname).resolve() for dirname in SOURCE_NOTE_DIRS]
+    allowed_dirs = [store_directory(root, root / dirname) for dirname in SOURCE_NOTE_DIRS]
     if not any(is_relative_to(resolved_source, allowed) for allowed in allowed_dirs):
         allowed = ", ".join(str(path) for path in allowed_dirs)
         raise ConfigError(f"Refusing to finalize note outside learning store: {source}; allowed: {allowed}")
@@ -476,7 +493,7 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 @contextmanager
 def state_update_lock(root: Path):
-    lock_path = root / "state" / ".processed.lock"
+    lock_path = store_directory(root, root / "state") / ".processed.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     if fcntl is None:
         raise ConfigError("State locking requires POSIX file locking support.")
@@ -552,6 +569,12 @@ def command_record(args: argparse.Namespace) -> int:
     source_skill = str(data.get("source_skill") or args.source_skill or "unknown")
     learning_type = str(data.get("learning_type") or args.learning_type)
     genericity = str(data.get("genericity") or args.genericity)
+    source_run = str(data.get("source_run_id") or args.source_run_id or "").strip()
+    application_status = str(data.get("application_status") or args.application_status)
+    if application_status not in {"proposed", "applied"}:
+        raise ConfigError("application_status must be proposed or applied.")
+    if source_run and not (data.get("lesson_family") or args.lesson_family):
+        raise ConfigError("A source run requires an explicit lesson family for capture identity.")
 
     fields = {
         "Problem": str(data.get("problem") or args.problem or ""),
@@ -560,7 +583,10 @@ def command_record(args: argparse.Namespace) -> int:
         "Verification": str(data.get("verification") or args.verification or ""),
         "Future Detection": str(data.get("future_detection") or args.future_detection or ""),
         "Future Prevention": str(data.get("future_prevention") or args.future_prevention or ""),
-        "Promotion Decision": "Pending consolidation.",
+        "Promotion Decision": (
+            "Already applied; verify current coverage before archival, without applying it again."
+            if application_status == "applied" else "Proposed; pending consolidation and applicable authority."
+        ),
     }
     body = f"# {title}\n\n" + "\n".join(section(name, value) for name, value in fields.items())
     routing = routing_from_args(
@@ -589,11 +615,93 @@ def command_record(args: argparse.Namespace) -> int:
         "status": "inbox",
         "genericity": genericity,
         "promoted_targets": "[]",
+        "application_status": application_status,
+        "source_run_id": source_run,
     }
+    targets = unique_values(coerce_list(data.get("applied_targets")) + (args.applied_target or []))
+    evidence = str(data.get("application_evidence") or args.application_evidence or "").strip()
+    if application_status == "applied":
+        if not targets or not evidence or not fields["Verification"].strip():
+            raise ConfigError("Applied learning requires targets, application evidence and verification.")
+        snapshots = []
+        for value in targets + [evidence]:
+            target = Path(value).expanduser().resolve()
+            if not target.is_file():
+                raise ConfigError(f"Application evidence/target is not a file: {target}")
+            snapshots.append({"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
+        fm["applied_targets"] = json.dumps(snapshots[:-1], sort_keys=True)
+        fm["application_evidence"] = json.dumps(snapshots[-1], sort_keys=True)
+    elif targets or evidence:
+        raise ConfigError("Applied targets/evidence require application_status=applied.")
     apply_routing_frontmatter(fm, routing)
-    filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(title)}-{note_id[:8]}.md"
-    path = unique_path(root / "inbox" / filename)
-    write_note(path, fm, body)
+    identity = [str(Path(project_path).expanduser().resolve()), source_run, routing["lesson_family"]]
+    capture_key = hashlib.sha256(json.dumps(identity).encode()).hexdigest() if source_run else ""
+    # Producer names and generated IDs are not part of a shared terminal event.
+    content = {key: value for key, value in fm.items() if key not in {"id", "created_at", "source_skill"}}
+    content["project_path"] = identity[0]
+    digest = hashlib.sha256(json.dumps([content, body], sort_keys=True).encode()).hexdigest()
+    filename = f"{slugify(title)}-{capture_key}.md" if capture_key else f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(title)}-{note_id[:8]}.md"
+    if capture_key:
+        fm.update(capture_key=capture_key, capture_digest=digest)
+    with state_update_lock(root):
+        state = load_state(root)
+        if (not isinstance(state, dict) or not isinstance(state.get("captures", {}), dict)
+                or not isinstance(state.get("processed", {}), dict)):
+            raise ConfigError("Capture state must contain an object mapping.")
+        recover_finalizations(root, state)
+        captures = state.setdefault("captures", {})
+        existing = captures.get(capture_key) if capture_key else None
+        if existing is not None:
+            if not isinstance(existing, dict) or not all(isinstance(existing.get(key), str) for key in ("id", "path", "digest")):
+                raise ConfigError("Existing capture state is malformed.")
+            if existing.get("digest") != digest:
+                raise ConfigError("Capture identity already exists with different content; reconcile the existing note.")
+            entry = state.get("processed", {}).get(existing["id"], existing)
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                raise ConfigError("Existing capture location is malformed.")
+            path = Path(entry["path"])
+            resolved_path = path.resolve()
+            if not resolved_path.is_relative_to(root.resolve()):
+                raise ConfigError("Existing capture is outside the learning store; reconcile state.")
+            if not resolved_path.is_file():
+                existing = None
+            elif read_note(resolved_path)[0].get("id") != existing["id"]:
+                raise ConfigError("Existing capture identity does not match its note; reconcile state.")
+            else:
+                print(path)
+                return 0
+        if capture_key:
+            # The stable filename and metadata survive a crash before index commit.
+            candidates = [path for name in SOURCE_NOTE_DIRS for path in (root / name).glob(f"*-{capture_key}.md")]
+            archive_dir = store_directory(root, root / "processed")
+            candidates.extend(archive_dir.glob(f"*/*/*-{capture_key}.md"))
+            recovered = [path for path in candidates if path.exists()]
+            if len(recovered) > 1:
+                raise ConfigError("Multiple notes share capture identity; reconcile existing captures.")
+            if recovered:
+                path = recovered[0]
+                if not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+                    raise ConfigError("Recovered capture is outside the learning store.")
+                previous, _ = read_note(path)
+                if previous.get("capture_key") != capture_key or previous.get("capture_digest") != digest or not previous.get("id"):
+                    raise ConfigError("Capture identity already exists with different content; reconcile the existing note.")
+                captures[capture_key] = {"id": previous["id"], "path": str(path), "digest": digest}
+                save_state(root, state)
+                print(path)
+                return 0
+            if capture_key in captures:
+                raise ConfigError("Existing capture is missing; reconcile state.")
+        path = store_directory(root, root / "inbox") / filename
+        if not capture_key:
+            path = unique_path(path)
+        atomic_write_text(path, render_frontmatter(fm, body))
+        if capture_key:
+            captures[capture_key] = {"id": note_id, "path": str(path), "digest": digest}
+            try:
+                save_state(root, state)
+            except Exception:
+                path.unlink()
+                raise
     print(path)
     return 0
 
@@ -642,6 +750,10 @@ def note_summary(path: Path) -> dict[str, str]:
         "checked": ", ".join(checked),
         "review_reason": fm.get("review_reason", ""),
         "lesson_family": fm.get("lesson_family", ""),
+        "application_status": fm.get("application_status", "proposed"),
+        "source_run_id": fm.get("source_run_id", ""),
+        "applied_targets": fm.get("applied_targets", "[]"),
+        "application_evidence": fm.get("application_evidence", ""),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
@@ -690,15 +802,17 @@ def command_prepare_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
     ensure_store(root)
-    inbox = [note_summary(path) for path in sorted((root / "inbox").glob("*.md"))]
-    review = [note_summary(path) for path in sorted((root / "needs-review").glob("*.md"))]
-    payload = {
-        "run_id": datetime.now().strftime("%Y%m%d-%H%M%S"),
-        "learning_root": str(root),
-        "inbox": inbox,
-        "needs_review": review,
-        "review_analysis": review_analysis(config, review),
-    }
+    with state_update_lock(root):
+        inbox = [note_summary(path) for path in sorted((root / "inbox").glob("*.md"))]
+        review = [note_summary(path) for path in sorted((root / "needs-review").glob("*.md"))]
+        payload = {
+            "run_id": datetime.now().strftime("%Y%m%d-%H%M%S"),
+            "learning_root": str(root),
+            "inbox": inbox,
+            "needs_review": review,
+            "review_analysis": review_analysis(config, review),
+            "pending_finalizations": [str(path) for path in finalization_journals(root)],
+        }
     print(json.dumps(payload, indent=2))
     return 0
 
@@ -723,6 +837,86 @@ def update_processed_state(root: Path, note_id: str, entry: dict[str, Any]) -> N
         state = load_state(root)
         state.setdefault("processed", {})[note_id] = entry
         save_state(root, state)
+
+
+def finalization_journals(root: Path) -> list[Path]:
+    return sorted(store_directory(root, root / "state" / "finalizations").glob("*.json"))
+
+
+def recover_finalizations(
+    root: Path, state: dict[str, Any], *, rollback: bool = False, only: Path | None = None,
+) -> list[dict[str, str]]:
+    """Reconcile prepared filesystem/state commits while the caller holds the lock."""
+    if not isinstance(state, dict) or not isinstance(state.get("processed", {}), dict):
+        raise ConfigError("Finalization state must contain a processed object mapping.")
+    recovered = []
+    for journal in [only] if only else finalization_journals(root):
+        if not journal.resolve().is_relative_to(root.resolve()):
+            raise ConfigError("Finalization journal is outside the learning store.")
+        try:
+            data = json.loads(journal.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"Unreadable finalization journal: {journal}") from exc
+        if (not isinstance(data, dict) or data.get("version") != 1
+                or any(not isinstance(data.get(key), str) for key in
+                       ("note_id", "source", "destination", "original_text", "result_text"))
+                or not isinstance(data.get("entry"), dict)):
+            raise ConfigError("Malformed finalization journal; manual reconciliation required.")
+        source, dest = Path(data["source"]).resolve(), Path(data["destination"]).resolve()
+        entry, note_id = data["entry"], data["note_id"]
+        allowed = [store_directory(root, root / name) for name in SOURCE_NOTE_DIRS]
+        if (not any(source.is_relative_to(path) for path in allowed)
+                or not dest.is_relative_to(root.resolve())
+                or Path(str(entry.get("path", ""))).resolve() != dest
+                or entry.get("status") not in {"processed", "rejected", "needs-review"}):
+            raise ConfigError("Finalization journal has invalid store paths or status.")
+        expected_dir = root / ("needs-review" if entry["status"] == "needs-review" else "processed")
+        if not dest.is_relative_to(store_directory(root, expected_dir)):
+            raise ConfigError("Finalization destination does not match its status.")
+        original = data["original_text"].encode()
+        result = data["result_text"].encode()
+        if (parse_frontmatter(data["result_text"])[0].get("id", source.stem) != note_id
+                or not note_id):
+            raise ConfigError("Finalization journal note identity is invalid.")
+        current = state.get("processed", {}).get(note_id)
+        previous = data.get("previous_entry")
+        if current != previous and current != entry:
+            raise ConfigError("Finalization state changed; manual reconciliation required.")
+        src_bytes = source.read_bytes() if source.is_file() else None
+        dst_bytes = dest.read_bytes() if dest.is_file() else None
+        completed_move = dst_bytes == result and (source == dest or src_bytes is None)
+        if current == entry and completed_move:
+            outcome = "committed"
+        elif current == entry and current != previous:
+            raise ConfigError("Committed finalization does not match its note; reconcile state.")
+        elif completed_move and not rollback:
+            state.setdefault("processed", {})[note_id] = entry
+            save_state(root, state)
+            outcome = "committed"
+        else:
+            allowed_dest = (None, original, result) if source == dest else (None, result)
+            if src_bytes not in (None, original, result) or dst_bytes not in allowed_dest:
+                raise ConfigError("Finalization note changed; preserve it for manual reconciliation.")
+            if src_bytes is None and dst_bytes is None:
+                raise ConfigError("Finalization source and destination are missing; reconcile journal.")
+            if src_bytes != original:
+                store_directory(root, source.parent)
+                atomic_write_text(source, data["original_text"])
+            if source != dest and dest.exists():
+                dest.unlink()
+            outcome = "rolled-back"
+        journal.unlink()
+        recovered.append({"note_id": note_id, "outcome": outcome})
+    return recovered
+
+
+def command_recover_finalizations(args: argparse.Namespace) -> int:
+    root = learning_root(load_config(args.config))
+    ensure_store(root)
+    with state_update_lock(root):
+        recovered = recover_finalizations(root, load_state(root))
+    print(json.dumps({"recovered": recovered}))
+    return 0
 
 
 def instruction_target(path: Path, root: Path) -> bool:
@@ -843,70 +1037,68 @@ def command_finalize_note(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
     ensure_store(root)
-    source = validate_note_source(root, Path(args.file))
-    original_text = source.read_text(encoding="utf-8")
-    fm, body = parse_frontmatter(original_text)
-    note_id = fm.get("id", source.stem)
-    status = args.status
-    routing = routing_from_args(args, fm, body, source)
-    if args.enforce_routing:
-        enforce_routing_contract(routing)
-    apply_routing_frontmatter(fm, routing)
-    fm["status"] = status
-    fm["processed_at"] = now_iso()
-    fm["processing_rationale"] = args.rationale
-    if args.run_id:
-        fm["consolidation_run"] = args.run_id
-
-    if status == "needs-review":
-        fm["review_reason"] = args.rationale
-        body = ensure_review_block(body)
-        dest = root / "needs-review" / source.name
-    elif status in {"processed", "rejected"}:
-        today = datetime.now()
-        dest = root / "processed" / f"{today.year:04d}" / f"{today.month:02d}" / source.name
-    else:
-        raise SystemExit(f"Unsupported status: {status}")
-
-    moved = False
-    final = dest
     with state_update_lock(root):
         state = load_state(root)
+        recover_finalizations(root, state)
+        source = validate_note_source(root, Path(args.file))
+        original_text = source.read_text(encoding="utf-8")
+        fm, body = parse_frontmatter(original_text)
+        note_id = fm.get("id", source.stem)
+        status = args.status
+        routing = routing_from_args(args, fm, body, source)
+        if args.enforce_routing:
+            enforce_routing_contract(routing)
+        apply_routing_frontmatter(fm, routing)
+        fm["status"] = status
+        fm["processed_at"] = now_iso()
+        fm["processing_rationale"] = args.rationale
+        if args.run_id:
+            fm["consolidation_run"] = args.run_id
+        if status == "needs-review":
+            fm["review_reason"] = args.rationale
+            body = ensure_review_block(body)
+            dest = root / "needs-review" / source.name
+        elif status in {"processed", "rejected"}:
+            today = datetime.now()
+            dest = root / "processed" / f"{today.year:04d}" / f"{today.month:02d}" / source.name
+        else:
+            raise ConfigError(f"Unsupported status: {status}")
         review_metadata: dict[str, str] = {}
         if args.review_evidence:
-            if source.read_text(encoding="utf-8") != original_text:
-                raise ConfigError("Review source changed while waiting for finalization.")
             review_metadata = validate_autonomous_review(
                 config, root, source, note_id, body, args, state, routing
             )
             fm.update(review_metadata)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        write_note(source, fm, body)
-        if source == dest.resolve():
-            final = dest
-        else:
-            final = unique_path(dest)
+        store_directory(root, dest.parent).mkdir(parents=True, exist_ok=True)
+        final = dest if source == dest.resolve() else unique_path(dest)
+        result_text = render_frontmatter(fm, body)
+        entry = {
+            "path": str(final), "status": status, "processed_at": fm["processed_at"],
+            "rationale": args.rationale, **routing_state_payload(routing), **review_metadata,
+        }
+        for key in ("capture_key", "capture_digest"):
+            if key in fm:
+                entry[key] = fm[key]
+        if review_metadata:
+            entry["review_archive_sha256"] = hashlib.sha256(result_text.encode()).hexdigest()
+        journal_dir = store_directory(root, root / "state" / "finalizations")
+        journal = journal_dir / f"{hashlib.sha256(note_id.encode()).hexdigest()}.json"
+        transaction = {
+            "version": 1, "note_id": note_id, "source": str(source), "destination": str(final),
+            "original_text": original_text, "result_text": result_text, "entry": entry,
+            "previous_entry": state.get("processed", {}).get(note_id),
+        }
+        atomic_write_text(journal, json.dumps(transaction, sort_keys=True) + "\n")
         try:
+            atomic_write_text(source, result_text)
             if source != final.resolve():
                 shutil.move(str(source), str(final))
-                moved = True
-            state.setdefault("processed", {})[note_id] = {
-                "path": str(final),
-                "status": status,
-                "processed_at": fm["processed_at"],
-                "rationale": args.rationale,
-                **routing_state_payload(routing),
-                **review_metadata,
-            }
-            if review_metadata:
-                state["processed"][note_id]["review_archive_sha256"] = hashlib.sha256(final.read_bytes()).hexdigest()
+            state.setdefault("processed", {})[note_id] = entry
             save_state(root, state)
         except Exception:
-            if moved and final.exists() and not source.exists():
-                shutil.move(str(final), str(source))
-            if source.exists():
-                source.write_text(original_text, encoding="utf-8")
+            recover_finalizations(root, load_state(root), rollback=True, only=journal)
             raise
+        journal.unlink()
     print(final)
     return 0
 
@@ -966,46 +1158,49 @@ def command_write_report(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
     ensure_store(root)
-    review = [note_summary(path) for path in sorted((root / "needs-review").glob("*.md"))]
-    analysis = review_analysis(config, review)
-    evidence = args.review_evidence
-    if analysis["group_review_due"] and analysis["autonomous_instructions"] and not evidence:
-        raise ConfigError("Joint review is due: finalize resolved notes or supply --review-evidence accounting for every residual note.")
-    residuals = validate_residual_review(root, review, evidence) if evidence else {}
-    run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = unique_path(root / "reports" / f"{run_id}.md")
-    routing_section = ""
-    if routing_args_present(args):
-        routing = routing_from_args(args, {}, "", Path(f"{run_id}.md"))
-        if args.enforce_routing:
-            enforce_routing_contract(routing)
-        routing_section = routing_markdown(routing)
-    lines = [
-        f"# Agent Learning Consolidation {run_id}",
-        "",
-        f"- Generated: {now_iso()}",
-        f"- Queue: inbox={len(list((root / 'inbox').glob('*.md')))}, pending-review={analysis['pending_count']}.",
-        f"- Joint review threshold: {analysis['group_threshold']}; due: {str(analysis['group_review_due']).lower()}.",
-        "",
-        "## Summary",
-        "",
-        args.summary.strip(),
-    ]
-    if routing_section.strip():
-        lines.extend(["", routing_section.strip()])
-    if evidence:
-        lines.extend(["", "## Residual review", "", f"- Receipt: {Path(evidence).expanduser().resolve()}."])
-        lines.extend(f"- {key}: {count}." for key, count in sorted(residuals.items()))
-    body = "\n".join(lines) + "\n"
-    path.write_text(body, encoding="utf-8")
+    with state_update_lock(root):
+        if finalization_journals(root):
+            raise ConfigError("Pending finalizations must be reconciled before a completion report.")
+        review = [note_summary(path) for path in sorted((root / "needs-review").glob("*.md"))]
+        analysis = review_analysis(config, review)
+        evidence = args.review_evidence
+        if analysis["group_review_due"] and analysis["autonomous_instructions"] and not evidence:
+            raise ConfigError("Joint review is due: finalize resolved notes or supply --review-evidence accounting for every residual note.")
+        residuals = validate_residual_review(root, review, evidence) if evidence else {}
+        run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = unique_path(root / "reports" / f"{run_id}.md")
+        routing_section = ""
+        if routing_args_present(args):
+            routing = routing_from_args(args, {}, "", Path(f"{run_id}.md"))
+            if args.enforce_routing:
+                enforce_routing_contract(routing)
+            routing_section = routing_markdown(routing)
+        lines = [
+            f"# Agent Learning Consolidation {run_id}",
+            "",
+            f"- Generated: {now_iso()}",
+            f"- Queue: inbox={len(list((root / 'inbox').glob('*.md')))}, pending-review={analysis['pending_count']}.",
+            f"- Joint review threshold: {analysis['group_threshold']}; due: {str(analysis['group_review_due']).lower()}.",
+            "",
+            "## Summary",
+            "",
+            args.summary.strip(),
+        ]
+        if routing_section.strip():
+            lines.extend(["", routing_section.strip()])
+        if evidence:
+            lines.extend(["", "## Residual review", "", f"- Receipt: {Path(evidence).expanduser().resolve()}."])
+            lines.extend(f"- {key}: {count}." for key, count in sorted(residuals.items()))
+        body = "\n".join(lines) + "\n"
+        atomic_write_text(path, body)
     print(path)
     return 0
 
 
-def frontmatter_from_state_entry(entry: dict[str, Any]) -> dict[str, Any]:
+def frontmatter_from_state_entry(entry: dict[str, Any], read_archives: bool = False) -> dict[str, Any]:
     path_value = str(entry.get("path") or "")
     path = Path(path_value) if path_value else Path()
-    if path_value and path.exists():
+    if read_archives and path_value and path.exists():
         fm, _body = read_note(path)
         return {
             "lesson_family": fm.get("lesson_family", entry.get("lesson_family", "")),
@@ -1052,51 +1247,53 @@ def command_summarize_runs(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
     ensure_store(root)
-    validate_since_date(args.since)
-    state = load_state(root)
-    processed = state.get("processed", {})
-    by_scope: dict[str, int] = {}
-    by_recurrence: dict[str, int] = {}
-    by_family: dict[str, int] = {}
-    duplicate_after_prevention = 0
-    missing_routing = 0
-    processed_count = 0
+    with state_update_lock(root):
+        validate_since_date(args.since)
+        state = load_state(root)
+        processed = state.get("processed", {})
+        by_scope: dict[str, int] = {}
+        by_recurrence: dict[str, int] = {}
+        by_family: dict[str, int] = {}
+        duplicate_after_prevention = 0
+        missing_routing = 0
+        processed_count = 0
 
-    for entry in processed.values():
-        if not isinstance(entry, dict) or not processed_entry_in_window(entry, args.since):
-            continue
-        processed_count += 1
-        routing = frontmatter_from_state_entry(entry)
-        scope = str(routing.get("scope") or "not-recorded")
-        recurrence = str(routing.get("recurrence_check") or "not-recorded")
-        family = str(routing.get("lesson_family") or "not-recorded")
-        prevention_targets = routing.get("prevention_targets") or []
-        by_scope[scope] = by_scope.get(scope, 0) + 1
-        by_recurrence[recurrence] = by_recurrence.get(recurrence, 0) + 1
-        by_family[family] = by_family.get(family, 0) + 1
-        if recurrence == "duplicate-after-prevention":
-            duplicate_after_prevention += 1
-        if (
-            entry.get("status") == "processed"
-            and scope not in {"skill-detection", "needs-review"}
-            and not prevention_targets
-        ):
-            missing_routing += 1
+        for entry in processed.values():
+            if not isinstance(entry, dict) or not processed_entry_in_window(entry, args.since):
+                continue
+            processed_count += 1
+            routing = frontmatter_from_state_entry(entry, args.read_archives)
+            scope = str(routing.get("scope") or "not-recorded")
+            recurrence = str(routing.get("recurrence_check") or "not-recorded")
+            family = str(routing.get("lesson_family") or "not-recorded")
+            prevention_targets = routing.get("prevention_targets") or []
+            by_scope[scope] = by_scope.get(scope, 0) + 1
+            by_recurrence[recurrence] = by_recurrence.get(recurrence, 0) + 1
+            by_family[family] = by_family.get(family, 0) + 1
+            if recurrence == "duplicate-after-prevention":
+                duplicate_after_prevention += 1
+            if (
+                entry.get("status") == "processed"
+                and scope not in {"skill-detection", "needs-review"}
+                and not prevention_targets
+            ):
+                missing_routing += 1
 
-    payload = {
-        "learning_root": str(root),
-        "since": args.since or "",
-        "processed_count": processed_count,
-        "queue": {
-            "inbox": len(list((root / "inbox").glob("*.md"))),
-            "needs_review": len(list((root / "needs-review").glob("*.md"))),
-        },
-        "by_scope": dict(sorted(by_scope.items())),
-        "by_recurrence": dict(sorted(by_recurrence.items())),
-        "lesson_families": dict(sorted(by_family.items())),
-        "missing_routing_count": missing_routing,
-        "duplicate_after_prevention_count": duplicate_after_prevention,
-    }
+        payload = {
+            "learning_root": str(root),
+            "since": args.since or "",
+            "processed_count": processed_count,
+            "queue": {
+                "inbox": len(list((root / "inbox").glob("*.md"))),
+                "needs_review": len(list((root / "needs-review").glob("*.md"))),
+            },
+            "by_scope": dict(sorted(by_scope.items())),
+            "by_recurrence": dict(sorted(by_recurrence.items())),
+            "lesson_families": dict(sorted(by_family.items())),
+            "missing_routing_count": missing_routing,
+            "pending_finalizations": len(finalization_journals(root)),
+            "duplicate_after_prevention_count": duplicate_after_prevention,
+        }
     if args.format == "markdown":
         print(summary_markdown(payload))
     else:
@@ -1111,6 +1308,7 @@ def summary_markdown(payload: dict[str, Any]) -> str:
         f"- Since: {payload['since'] or 'all-time'}",
         f"- Processed: {payload['processed_count']}",
         f"- Inbox: {payload['queue']['inbox']}",
+        f"- Pending finalizations: {payload.get('pending_finalizations', 0)}",
         f"- Needs review: {payload['queue']['needs_review']}",
         f"- Missing routing: {payload['missing_routing_count']}",
         f"- Duplicate after prevention: {payload['duplicate_after_prevention_count']}",
@@ -1249,45 +1447,25 @@ def pending_review_notes(root: Path) -> list[dict[str, str]]:
 
 
 def notification_body(config: dict[str, str], root: Path) -> tuple[str, str] | None:
-    notes = pending_review_notes(root)
-    if not notes:
-        return None
-    subject = f"Agent learning review needed: {len(notes)} note(s)"
-    lines = [
-        "There are agent-learning notes waiting for review.",
-        "",
-        f"Folder: {root / 'needs-review'}",
-        "",
-    ]
-    for note in notes:
-        reason = note["review_reason"] or "No review reason recorded"
-        project = note["project_path"] or "Unknown project"
-        lines.extend(
-            [
-                f"- {note['title']}",
-                f"  Project: {project}",
-                f"  Reason: {reason}",
-                f"  Path: {note['path']}",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "In Obsidian, check exactly one Review Decision box:",
-            "- Approve: promote this rule",
-            "- Retry: edited and reprocess",
-            "- Reject: archive without promotion",
-        ]
-    )
-    _ = config
-    return subject, "\n".join(lines)
+    pipeline = pipeline_store(root)
+    with state_update_lock(root):
+        payload = pipeline.digest(pipeline.load(), pending_review_notes(root))
+    return (payload["subject"], payload["body"]) if payload else None
 
 
-def send_msmtp(recipient: str, subject: str, body: str) -> None:
+def send_msmtp(recipient: str, subject: str, body: str, html_body: str = "") -> None:
     if not shutil.which("msmtp"):
         raise SystemExit("msmtp is not available; configure Gmail connector or install msmtp.")
-    message = f"To: {recipient}\nSubject: {subject}\n\n{body}\n"
-    subprocess.run(["msmtp", "--read-envelope-from", "-t"], input=message, text=True, check=True)
+    if not re.fullmatch(r"[^\s<>;,\r\n]+@[^\s<>;,\r\n]+\.[^\s<>;,\r\n]+", recipient):
+        raise ConfigError("Expected one configured email recipient.")
+    message = EmailMessage(policy=SMTP)
+    message["To"] = recipient
+    message["Subject"] = subject
+    message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
+    subprocess.run(["msmtp", "--", recipient], input=message.as_string(),
+                   text=True, check=True, timeout=60)
 
 
 def is_placeholder_email(value: str) -> bool:
@@ -1298,19 +1476,161 @@ def command_notify(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
     ensure_store(root)
-    payload = notification_body(config, root)
+    pipeline = pipeline_store(root)
+    with state_update_lock(root):
+        state = pipeline.load()
+        if state["outbox"] and (not args.check_digest or state["outbox"]["digest_id"] != args.check_digest):
+            raise ConfigError("A pending notification needs provider reconciliation before another send.")
+        payload = pipeline.digest(state, pending_review_notes(root))
     if payload is None:
-        print("NO_PENDING_REVIEW")
+        print("NO_ACTION_REQUIRED")
         return 0
-    subject, body = payload
+    if args.check_digest and args.check_digest != payload["digest_id"]:
+        raise ConfigError("Digest changed; prepare the current state before sending.")
     if args.send_msmtp:
         recipient = config.get("AGENT_LEARNING_EMAIL", "").strip()
         if not recipient or is_placeholder_email(recipient):
             raise SystemExit("AGENT_LEARNING_EMAIL is not configured for sending.")
-        send_msmtp(recipient, subject, body)
+        if not shutil.which("msmtp"):
+            raise ConfigError("msmtp is unavailable; no notification was reserved.")
+        pipeline.reserve(payload, lambda value: pipeline.digest(value, pending_review_notes(root)))
+        # An exception preserves the outbox: provider acceptance may be uncertain.
+        send_msmtp(recipient, payload["subject"], payload["body"], payload["html"])
+        pipeline.acknowledge(payload["digest_id"], "msmtp exited successfully")
         print(f"SENT {recipient}")
         return 0
-    print(json.dumps({"subject": subject, "body": body}, indent=2))
+    if args.prepare:
+        pipeline.reserve(payload, lambda value: pipeline.digest(value, pending_review_notes(root)))
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_send_email(args: argparse.Namespace) -> int:
+    """Send an explicitly prepared plain-text operational email through msmtp."""
+    config = load_config(args.config)
+    recipient = config.get("AGENT_LEARNING_EMAIL", "").strip()
+    if not recipient or is_placeholder_email(recipient):
+        raise SystemExit("AGENT_LEARNING_EMAIL is not configured for sending.")
+    body_path = Path(args.body_file).expanduser()
+    if not body_path.is_file():
+        raise SystemExit(f"Email body file is missing: {body_path}")
+    body = body_path.read_text(encoding="utf-8")
+    send_msmtp(recipient, args.subject, body)
+    print(f"SENT {recipient}")
+    return 0
+
+
+def pipeline_store(root: Path) -> Pipeline:
+    return Pipeline(root, lambda: state_update_lock(root))
+
+
+def pipeline_roots(root: Path, added: list[str] | None = None) -> list[str]:
+    paths = [str(path.expanduser().resolve()) for path in DEFAULT_AUDIT_TARGETS]
+    paths.append(str(DEFAULT_AUDIT_SKILLS_DIR.resolve()))
+    with state_update_lock(root):
+        indexed = load_state(root).get("processed", {})
+        for entry in indexed.values():
+            if not isinstance(entry, dict):
+                continue
+            for value in coerce_list(entry.get("prevention_targets")) + coerce_list(entry.get("detection_targets")):
+                target = concrete_routing_target_path(value)
+                if target is not None and target.is_file() and instruction_target(target, root):
+                    paths.append(str(target))
+    for value in added or []:
+        target = Path(value).expanduser().resolve(strict=True)
+        if not target.is_file() or not instruction_target(target, root):
+            raise ConfigError("Changed targets must be existing instruction files outside the store.")
+        paths.append(str(target))
+    paths = sorted(set(paths))
+    if any(not Path(value).exists() for value in paths):
+        raise ConfigError("Audit roots are unavailable; this is not a clean scan.")
+    return paths
+
+
+def pipeline_inventory(root: Path) -> list[dict[str, str]]:
+    files: set[Path] = set()
+    for value in pipeline_roots(root):
+        path = Path(value)
+        if path.is_dir():
+            files.update(path.glob("**/SKILL.md"))
+            files.update(path.glob("**/AGENTS.md"))
+        else:
+            files.add(path)
+    return [snapshot(str(path)) for path in sorted(files) if path.is_file()]
+
+
+def command_pipeline(args: argparse.Namespace) -> int:
+    root = learning_root(load_config(args.config))
+    ensure_store(root)
+    pipeline = pipeline_store(root)
+    operation = args.command
+    if operation == "pipeline-configure":
+        pipeline.configure(args.ordinary_thread, args.release_thread, args.language)
+        result = {"ordinary": chat_url(args.ordinary_thread), "release": chat_url(args.release_thread)}
+    elif operation == "pipeline-status":
+        result = pipeline.status()
+    elif operation == "pipeline-begin":
+        result = pipeline.begin(args.run_id, args.runner, pipeline_inventory(root))
+    elif operation == "pipeline-issue":
+        issue = read_json_input(args.from_json)
+        for ref in issue.get("sources", []):
+            if not isinstance(ref, dict) or not ref.get("note_id"):
+                raise ConfigError("Review sources need an explicit note ID.")
+            source = validate_note_source(root, Path(ref["path"]))
+            summary = note_summary(source)
+            if summary["id"] != ref["note_id"] or (
+                summary["review_decision"] not in {"pending", "ambiguous"}
+                and issue.get("status") not in {"resolved", "justified"}
+            ):
+                raise ConfigError("Explicit human decisions take precedence over pipeline classifications.")
+        result = pipeline.update_issue(issue)
+    elif operation == "pipeline-finish":
+        inventory = pipeline_inventory(root) if args.status == "completed" else None
+        result = pipeline.finish(args.run_id, args.status, args.summary, args.report, args.target or [], inventory)
+    elif operation == "pipeline-release-status":
+        result = pipeline.weekly_release_status()
+    elif operation == "notify-ack":
+        pipeline.acknowledge(args.digest_id, args.receipt, not args.not_delivered)
+        result = {"acknowledged": args.digest_id, "delivered": not args.not_delivered}
+    else:
+        raise ConfigError("Unsupported pipeline operation.")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_pipeline_audit(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    root = learning_root(config)
+    ensure_store(root)
+    pipeline = pipeline_store(root)
+    state = pipeline.status()
+    pipeline.active(state, args.run_id)
+    if args.weekly and not state["weekly_due"]:
+        print(json.dumps(state["weekly"]))
+        return 0
+    paths = pipeline_roots(root, args.target)
+    baseline = None
+    previous = state["weekly"]
+    if previous and previous.get("roots") == paths:
+        ref = previous["snapshot"]
+        if snapshot(ref["path"])["sha256"] != ref["sha256"]:
+            raise ConfigError("Previous audit snapshot changed; preserve and reconcile it.")
+        previous_payload = json.loads(Path(ref["path"]).read_text())["audit"]
+        # The audit helper expects its own payload, not the pipeline envelope.
+        baseline = pipeline.inside("reports/.pipeline-baseline-" + uuid.uuid4().hex + ".json")
+        pipeline.write(baseline, previous_payload)
+    capture = io.StringIO()
+    try:
+        with redirect_stdout(capture):
+            command_audit_rules(argparse.Namespace(path=paths, skills_dir=None, all_md=False,
+                               baseline=baseline, similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD,
+                               conflict_threshold=DEFAULT_CONFLICT_THRESHOLD))
+        payload = json.loads(capture.getvalue())
+    finally:
+        if baseline and baseline.exists():
+            baseline.unlink()
+    result = pipeline.audit(args.run_id, payload, paths, args.weekly)
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -1327,10 +1647,10 @@ def command_privacy_scan(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def iter_markdown_bullets(path: Path) -> list[dict[str, Any]]:
+def iter_markdown_bullets(path: Path, text: str | None = None) -> list[dict[str, Any]]:
     bullets: list[dict[str, Any]] = []
     in_fence = False
-    for idx, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+    for idx, raw in enumerate((text if text is not None else path.read_text(encoding="utf-8", errors="ignore")).splitlines(), start=1):
         line = raw.rstrip("\n")
         stripped = line.lstrip()
         if stripped.startswith("```"):
@@ -1372,6 +1692,23 @@ def rule_polarity(text: str) -> int:
 
 
 def command_audit_rules(args: argparse.Namespace) -> int:
+    baseline: dict[str, dict[str, Any]] | None = None
+    if args.baseline:
+        try:
+            previous = json.loads(args.baseline.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"Cannot read audit baseline: {exc}") from exc
+        snapshots = previous.get("file_snapshots") if isinstance(previous, dict) else None
+        if not isinstance(snapshots, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("path"), str)
+            or not isinstance(item.get("words"), int) or item["words"] < 0
+            or not re.fullmatch(r"[a-f0-9]{64}", str(item.get("sha256", "")))
+            for item in snapshots
+        ):
+            raise ConfigError("Audit baseline needs valid file_snapshots with paths, hashes and word counts.")
+        baseline = {item["path"]: item for item in snapshots}
+        if len(baseline) != len(snapshots):
+            raise ConfigError("Audit baseline contains duplicate file paths.")
     paths: list[Path] = []
     if args.path:
         paths.extend(Path(p).expanduser() for p in args.path)
@@ -1393,8 +1730,19 @@ def command_audit_rules(args: argparse.Namespace) -> int:
             markdown_files.append(path)
 
     rules: list[dict[str, Any]] = []
+    file_snapshots: list[dict[str, Any]] = []
+    changed_files: list[str] = []
     for md_path in sorted(set(markdown_files)):
-        for bullet in iter_markdown_bullets(md_path):
+        raw = md_path.read_bytes()
+        text = raw.decode("utf-8", errors="ignore")
+        snapshot = {"path": str(md_path), "sha256": hashlib.sha256(raw).hexdigest(),
+                    "words": len(text.split()), "lines": len(text.splitlines())}
+        previous_snapshot = (baseline or {}).get(str(md_path))
+        snapshot["word_delta"] = snapshot["words"] - previous_snapshot["words"] if previous_snapshot else None
+        file_snapshots.append(snapshot)
+        if previous_snapshot is None or previous_snapshot["sha256"] != snapshot["sha256"]:
+            changed_files.append(str(md_path))
+        for bullet in iter_markdown_bullets(md_path, text):
             bullet["norm"] = normalize_rule(bullet["text"])
             rules.append(bullet)
 
@@ -1406,6 +1754,9 @@ def command_audit_rules(args: argparse.Namespace) -> int:
         by_norm.setdefault(norm, []).append(rule)
 
     exact_duplicates = [group for group in by_norm.values() if len(group) > 1]
+    changed_set = set(changed_files)
+    if baseline is not None:
+        exact_duplicates = [group for group in exact_duplicates if any(rule["path"] in changed_set for rule in group)]
 
     similarity_threshold = float(args.similarity_threshold)
     conflict_threshold = float(args.conflict_threshold)
@@ -1426,6 +1777,8 @@ def command_audit_rules(args: argparse.Namespace) -> int:
             continue
         for idx, left in enumerate(group):
             for right in group[idx + 1 :]:
+                if baseline is not None and left["path"] not in changed_set and right["path"] not in changed_set:
+                    continue
                 key = (left["path"], left["line"], right["path"], right["line"])
                 if key in seen_pairs:
                     continue
@@ -1444,6 +1797,12 @@ def command_audit_rules(args: argparse.Namespace) -> int:
     payload = {
         "scanned_files": [str(path) for path in sorted(set(markdown_files))],
         "rule_count": len(rules),
+        "file_snapshots": file_snapshots,
+        "changed_files": changed_files,
+        "removed_files": sorted(set(baseline or {}) - {str(path) for path in markdown_files}),
+        "comparison_scope": "changed-targets" if baseline is not None else "full",
+        "semantic_approval": False,
+        "check_effectiveness": "not-evaluated",
         "exact_duplicates": exact_duplicates,
         "near_duplicates": sorted(near_duplicates, key=lambda item: item["ratio"], reverse=True),
         "potential_conflicts": sorted(potential_conflicts, key=lambda item: item["ratio"], reverse=True),
@@ -1608,6 +1967,9 @@ def build_parser() -> argparse.ArgumentParser:
     init_store = sub.add_parser("init-store")
     init_store.set_defaults(func=command_init_store)
 
+    recover = sub.add_parser("recover-finalizations", help="Reconcile interrupted note/state commits under the store lock")
+    recover.set_defaults(func=command_recover_finalizations)
+
     record = sub.add_parser("record")
     record.add_argument("--from-json")
     record.add_argument("--project-path")
@@ -1621,6 +1983,10 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--verification")
     record.add_argument("--future-detection")
     record.add_argument("--future-prevention")
+    record.add_argument("--source-run-id", default="")
+    record.add_argument("--application-status", choices=["proposed", "applied"], default="proposed")
+    record.add_argument("--applied-target", action="append")
+    record.add_argument("--application-evidence", help="Saved verification artifact for an already-applied improvement")
     add_routing_arguments(record)
     record.set_defaults(func=command_record)
 
@@ -1646,6 +2012,7 @@ def build_parser() -> argparse.ArgumentParser:
     summary = sub.add_parser("summarize-runs")
     summary.add_argument("--since", default="")
     summary.add_argument("--format", choices=["json", "markdown"], default="json")
+    summary.add_argument("--read-archives", action="store_true", help="Explicit legacy index reconstruction; ordinary summaries use state only")
     summary.set_defaults(func=command_summarize_runs)
 
     draft = sub.add_parser("create-template-draft")
@@ -1665,8 +2032,48 @@ def build_parser() -> argparse.ArgumentParser:
     draft.set_defaults(func=command_create_template_draft)
 
     notify = sub.add_parser("notify")
-    notify.add_argument("--send-msmtp", action="store_true")
+    mode = notify.add_mutually_exclusive_group()
+    mode.add_argument("--send-msmtp", action="store_true")
+    mode.add_argument("--prepare", action="store_true", help="Reserve the digest before connector submission")
+    mode.add_argument("--check-digest", help="Revalidate a reserved digest immediately before connector submission")
     notify.set_defaults(func=command_notify)
+
+    configure = sub.add_parser("pipeline-configure")
+    configure.add_argument("--ordinary-thread", required=True)
+    configure.add_argument("--release-thread", required=True)
+    configure.add_argument("--language", choices=["en", "it"], default="en")
+    configure.set_defaults(func=command_pipeline)
+    sub.add_parser("pipeline-status").set_defaults(func=command_pipeline)
+    sub.add_parser("pipeline-release-status").set_defaults(func=command_pipeline)
+    begin = sub.add_parser("pipeline-begin")
+    begin.add_argument("--run-id", required=True)
+    begin.add_argument("--runner", required=True, choices=["midnight", "noon"])
+    begin.set_defaults(func=command_pipeline)
+    issue = sub.add_parser("pipeline-issue")
+    issue.add_argument("--from-json", required=True)
+    issue.set_defaults(func=command_pipeline)
+    audit_cycle = sub.add_parser("pipeline-audit")
+    audit_cycle.add_argument("--run-id", required=True)
+    audit_cycle.add_argument("--weekly", action="store_true")
+    audit_cycle.add_argument("--target", action="append")
+    audit_cycle.set_defaults(func=command_pipeline_audit)
+    finish = sub.add_parser("pipeline-finish")
+    finish.add_argument("--run-id", required=True)
+    finish.add_argument("--status", required=True, choices=["completed", "partial", "failed"])
+    finish.add_argument("--summary", required=True)
+    finish.add_argument("--report", default="")
+    finish.add_argument("--target", action="append")
+    finish.set_defaults(func=command_pipeline)
+    ack = sub.add_parser("notify-ack")
+    ack.add_argument("--digest-id", required=True)
+    ack.add_argument("--receipt", required=True)
+    ack.add_argument("--not-delivered", action="store_true", help="Clear only after verified non-delivery")
+    ack.set_defaults(func=command_pipeline)
+
+    send_email = sub.add_parser("send-email")
+    send_email.add_argument("--subject", required=True)
+    send_email.add_argument("--body-file", required=True)
+    send_email.set_defaults(func=command_send_email)
 
     privacy = sub.add_parser("privacy-scan")
     privacy.add_argument("paths", nargs="+")
@@ -1678,6 +2085,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--similarity-threshold", default=str(DEFAULT_SIMILARITY_THRESHOLD))
     audit.add_argument("--conflict-threshold", default=str(DEFAULT_CONFLICT_THRESHOLD))
     audit.add_argument("--all-md", action="store_true")
+    audit.add_argument("--baseline", type=Path, help="Prior audit JSON; compare pairs touching changed targets only")
     audit.set_defaults(func=command_audit_rules)
 
     hook = sub.add_parser("hook-review-skills")
@@ -1694,7 +2102,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except ConfigError as exc:
+    except (ConfigError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 

@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-"${HOME}/.config"}/agent-learning-system"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
-CODEX_HOME="${CODEX_HOME:-"${HOME}/.codex"}"
 DEFAULT_LEARNING_DIR="${HOME}/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault"
 DEFAULT_EMAIL="user@example.com"
 LEARNING_DIR=""
@@ -16,35 +15,12 @@ INSTALL_AUTOMATIONS="1"
 AUTONOMOUS_REVIEW="0"
 REVIEW_GROUP_THRESHOLD="8"
 VALIDATE_ONLY="0"
-MARKDOWN_LIST=""
-
-cleanup() {
-  if [[ -n "${MARKDOWN_LIST}" && -f "${MARKDOWN_LIST}" ]]; then
-    rm -f "${MARKDOWN_LIST}"
-  fi
-}
-
-trap cleanup EXIT
-
 usage() {
   printf '%s\n' "Usage: $0 [--dir PATH] [--vault PATH] [--email ADDRESS] [--email-provider gmail|msmtp] [--autonomous-review|--manual-review] [--review-group-threshold N] [--skip-automations] [--validate-only]"
 }
 
 validate_project() {
-  markdown_files=()
-  MARKDOWN_LIST=$(mktemp)
-  find "${SCRIPT_DIR}" -name '*.md' -not -path '*/.git/*' -print0 > "${MARKDOWN_LIST}"
-  while IFS= read -r -d '' file; do
-    markdown_files+=("${file}")
-  done < "${MARKDOWN_LIST}"
-
-  if [[ ${#markdown_files[@]} -gt 0 ]]; then
-    markdownlint --config "${HOME}/.markdownlint.json" "${markdown_files[@]}"
-  fi
-
-  shellcheck --enable=all "${SCRIPT_DIR}/install.sh"
-  python3 -m py_compile "${SCRIPT_DIR}/scripts/agent_learning.py" "${SCRIPT_DIR}/tests/test_agent_learning.py"
-  python3 -m unittest discover -s "${SCRIPT_DIR}/tests"
+  bash "${SCRIPT_DIR}/scripts/check.sh"
 }
 
 quote_env() {
@@ -52,14 +28,6 @@ quote_env() {
   value=${1//\\/\\\\}
   value=${value//\"/\\\"}
   printf '"%s"' "${value}"
-}
-
-toml_string() {
-  quote_env "$1"
-}
-
-timestamp_ms() {
-  python3 -c 'import time; print(int(time.time() * 1000))'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -218,137 +186,9 @@ install_codex_link() {
   ln -s "${agent_dest}" "${codex_dest}"
 }
 
-write_automation() {
-  local id=$1
-  local name=$2
-  local prompt=$3
-  local rrule=$4
-  local reasoning_effort=$5
-  local automation_dir
-  local automation_file
-  local backup
-  local created_at
-  local cwd_value
-  local current_ms
-  local desired
-  local existing_updated_at
-  local id_value
-  local name_value
-  local prompt_value
-  local reasoning_effort_value
-  local rrule_value
-  local timestamp
-
-  automation_dir="${CODEX_HOME}/automations/${id}"
-  automation_file="${automation_dir}/automation.toml"
-  mkdir -p "${automation_dir}"
-
-  current_ms=$(timestamp_ms)
-  created_at="${current_ms}"
-  existing_updated_at="${created_at}"
-  if [[ -f "${automation_file}" ]]; then
-    created_at=$(sed -n 's/^created_at = //p' "${automation_file}" | head -n 1)
-    if [[ -z "${created_at}" ]]; then
-      created_at="${current_ms}"
-    fi
-    existing_updated_at=$(sed -n 's/^updated_at = //p' "${automation_file}" | head -n 1)
-    if [[ -z "${existing_updated_at}" ]]; then
-      existing_updated_at="${created_at}"
-    fi
-  fi
-  id_value=$(toml_string "${id}")
-  name_value=$(toml_string "${name}")
-  prompt_value=$(toml_string "${prompt}")
-  rrule_value=$(toml_string "${rrule}")
-  reasoning_effort_value=$(toml_string "${reasoning_effort}")
-  cwd_value=$(toml_string "${SCRIPT_DIR}")
-
-  desired=$(mktemp)
-  {
-    printf 'version = 1\n'
-    printf 'id = %s\n' "${id_value}"
-    printf 'kind = "cron"\n'
-    printf 'name = %s\n' "${name_value}"
-    printf 'prompt = %s\n' "${prompt_value}"
-    printf 'status = "ACTIVE"\n'
-    printf 'rrule = %s\n' "${rrule_value}"
-    printf 'model = "gpt-5.2"\n'
-    printf 'reasoning_effort = %s\n' "${reasoning_effort_value}"
-    printf 'execution_environment = "local"\n'
-    printf 'cwds = [%s]\n' "${cwd_value}"
-    printf 'created_at = %s\n' "${created_at}"
-    printf 'updated_at = %s\n' "${existing_updated_at}"
-  } > "${desired}"
-
-  if [[ -f "${automation_file}" ]] && cmp -s "${automation_file}" "${desired}"; then
-    rm -f "${desired}"
-    printf 'Automation already active: %s\n' "${id}"
-    return 0
-  fi
-
-  {
-    printf 'version = 1\n'
-    printf 'id = %s\n' "${id_value}"
-    printf 'kind = "cron"\n'
-    printf 'name = %s\n' "${name_value}"
-    printf 'prompt = %s\n' "${prompt_value}"
-    printf 'status = "ACTIVE"\n'
-    printf 'rrule = %s\n' "${rrule_value}"
-    printf 'model = "gpt-5.2"\n'
-    printf 'reasoning_effort = %s\n' "${reasoning_effort_value}"
-    printf 'execution_environment = "local"\n'
-    printf 'cwds = [%s]\n' "${cwd_value}"
-    printf 'created_at = %s\n' "${created_at}"
-    printf 'updated_at = %s\n' "${current_ms}"
-  } > "${desired}"
-
-  if [[ -f "${automation_file}" ]]; then
-    timestamp=$(date +%Y%m%d%H%M%S)
-    backup="${automation_file}.backup.${timestamp}"
-    cp "${automation_file}" "${backup}"
-    printf 'Backed up existing automation %s to %s\n' "${id}" "${backup}"
-  fi
-
-  mv "${desired}" "${automation_file}"
-  printf 'Installed active automation: %s\n' "${id}"
-}
-
 install_automations() {
-  local midnight_prompt
-  local morning_prompt
-  local noon_prompt
-
-  if [[ "${OBSIDIAN_PROVIDER}" != "direct" ]]; then
-    printf '%s\n' "Skipping Codex automations because Obsidian provider is ${OBSIDIAN_PROVIDER}."
-    return 0
-  fi
-
-  morning_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Check the configured AI Agent Learnings/needs-review directory. If there are no pending or ambiguous review notes, do nothing and do not send email. If the configured recipient is empty or still uses an example.com, example.org, example.net, or example.test placeholder, do not send email; report that ./install.sh --email ADDRESS must be run first. If there are pending or ambiguous review notes and the recipient is configured, send one concise email with count, note paths, project paths, and review reasons. Prefer the Gmail connector if available. If Gmail is unavailable, use python3 scripts/agent_learning.py notify --send-msmtp as the msmtp fallback. Do not modify learning notes from this automation."
-  noon_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the installed consolidate-agent-learnings skill, including its Joint Review workflow. Run prepare-run and inspect review_analysis; at its configured threshold (default 8 pending notes), reassess related pending notes together using their combined evidence. Honor explicit human decisions. When autonomous instruction review is enabled, resolve grounded technical or already-covered notes with saved review receipts and finalize-note --review-evidence plus --enforce-routing; leave genuine user choices or unresolved evidence pending and consolidate their questions. Promote instructions only, preserve unrelated edits, validate changed files, write a report, and do not commit or push. Do not reread all processed history."
-  midnight_prompt="Use the local Agent Learning System in ${SCRIPT_DIR}. Follow the installed consolidate-agent-learnings skill, including Joint Review. Process inbox and explicit review decisions, then inspect prepare-run review_analysis and reassess related pending notes jointly at the configured threshold (default 8). If autonomous instruction review is enabled, resolve evidence-backed technical or already-covered notes with a saved receipt and finalize-note --review-evidence --enforce-routing. Keep product, security and operational choices with the user; group residual questions. Preserve unrelated work, change only bounded instruction targets, validate Markdown and shell changes, write a report, and do not commit or push."
-  noon_prompt+=" Re-run prepare-run after inbox processing; follow the skill's target-overlap checks and write-report --review-evidence completion gate for a due residual queue."
-  midnight_prompt+=" Re-run prepare-run after inbox processing; follow the skill's target-overlap checks and write-report --review-evidence completion gate for a due residual queue."
-
-  write_automation \
-    "agent-learning-midnight-consolidation" \
-    "Agent Learning Midnight Consolidation" \
-    "${midnight_prompt}" \
-    "FREQ=DAILY;BYHOUR=0;BYMINUTE=0;BYSECOND=0" \
-    "medium"
-
-  write_automation \
-    "agent-learning-morning-review-email" \
-    "Agent Learning Morning Review Email" \
-    "${morning_prompt}" \
-    "FREQ=DAILY;BYHOUR=8;BYMINUTE=30;BYSECOND=0" \
-    "low"
-
-  write_automation \
-    "agent-learning-noon-consolidation" \
-    "Agent Learning Noon Consolidation" \
-    "${noon_prompt}" \
-    "FREQ=DAILY;BYHOUR=12;BYMINUTE=0;BYSECOND=0" \
-    "medium"
+  printf '%s\n' "Codex scheduled tasks require app setup. Existing tasks were not changed."
+  printf 'Open %s/automations/README.md for project and chat setup.\n' "${SCRIPT_DIR}"
 }
 
 for skill in record-agent-learning consolidate-agent-learnings; do

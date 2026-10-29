@@ -16,6 +16,7 @@ reusable lessons into agent instructions and review skills.
 - [Instruction and Skill Context](#instruction-and-skill-context)
 - [Conflict Detection Levels](#conflict-detection-levels)
 - [Architecture](#architecture)
+- [Session Learning](#session-learning)
 - [Skills](#skills)
 - [Review Skill Hooks](#review-skill-hooks)
 - [Automations](#automations)
@@ -30,7 +31,8 @@ The system keeps learning lightweight and auditable:
 - daily consolidation reads new inbox notes, review decisions and related
   pending cohorts when joint review is due;
 - reusable lessons are promoted to the smallest useful target;
-- no repository is committed or pushed automatically.
+- consolidation never commits or pushes; release preparation opens a PR for
+  user approval and merge.
 
 ## Repository Layout
 
@@ -42,17 +44,21 @@ The system keeps learning lightweight and auditable:
 ├── config.example.env
 ├── install.sh
 ├── automations/
+│   ├── consolidation.md
 │   ├── midnight-consolidation.md
 │   ├── morning-review-email.md
 │   ├── noon-consolidation.md
-│   ├── template-weekly-upstream-apply.md
-│   └── weekly-rule-audit.md
+│   ├── weekly-rule-audit.md
+│   └── weekly-release-pr.md
 ├── docs/
 │   ├── agent-ecosystem-architecture.md
 │   ├── auto-learning-pipeline-automations.md
-│   └── composable-learning-architecture.md
+│   ├── composable-learning-architecture.md
+│   └── session-learning.md
 ├── scripts/
-│   └── agent_learning.py
+│   ├── agent_learning.py
+│   ├── check.sh
+│   └── learning_pipeline.py
 ├── skills/
 │   ├── consolidate-agent-learnings/
 │   └── record-agent-learning/
@@ -75,7 +81,7 @@ The installer:
 - creates the learning store folders;
 - copies both skills into `~/.agents/skills`;
 - links `~/.codex/skills` to the installed `~/.agents/skills` copies;
-- installs or updates the daily Codex automations as active;
+- provides setup guidance for the Agent Learning Codex scheduled tasks;
 - validates Markdown, shell, and Python files.
 
 Pass `--dir PATH` to choose any filesystem directory as the learning-store base.
@@ -83,9 +89,11 @@ The store itself is created as `PATH/AI Agent Learnings/`. If `PATH` is inside
 an Obsidian vault, Obsidian will show the Markdown notes automatically; no
 Obsidian API or MCP server is required.
 
-Pass `--skip-automations` if you only want to install config and skills. If the
-Obsidian provider is `mcp-pending`, automation installation is skipped until
-direct filesystem access or a working MCP setup is configured.
+Configure the scheduled tasks in Codex after installation. The installer leaves
+existing tasks untouched and prints the setup location by default; pass
+`--skip-automations` to omit this reminder. If the Obsidian provider is
+`mcp-pending`, configure filesystem access or a working MCP setup before
+enabling consolidation tasks.
 
 Pass `--email ADDRESS` before relying on the morning review email. Without it,
 the installer records a reserved example address and the morning notification
@@ -97,7 +105,7 @@ access is the recommended mode for this project because the automation only
 needs local Markdown files.
 
 This setup flow follows `install.sh`, including validation, config creation,
-skill copy installation, Codex mirrors, automation records, and final local
+skill copy installation, Codex mirrors, automation setup guidance, and local
 checks.
 
 ```mermaid
@@ -133,6 +141,7 @@ covers:
 | Daily note consolidation | `agent-learning-system` |
 | Morning review notification | `agent-learning-system` |
 | Weekly duplicate and conflict audit | `agent-learning-system` |
+| Weekly release PR preparation | `agent-learning-system` |
 | Approved template draft apply | `agents-file-templates-and-skills` |
 | Generated-project refresh reports | `agents-file-templates-and-skills` |
 
@@ -299,6 +308,17 @@ The routing model is documented in
 That document defines prevention targets, detection targets, recurrence
 tracking, and draft-first upstreaming into reusable instruction templates.
 
+## Session Learning
+
+The [session learning contract](docs/session-learning.md) connects optional,
+explicit Retro analysis with the existing terminal Auto Learn and capture path.
+It covers independent comparisons, applied-versus-proposed evidence, source-run
+capture identity and maintenance of instruction/check cost. No retrospective
+runs automatically after each review batch.
+
+The [three-session pilot](docs/retro-pilot.md) records the independent baseline
+comparison, reconciliation and observed work without publishing raw session logs.
+
 ## Skills
 
 ### `record-agent-learning`
@@ -346,6 +366,11 @@ Limit the scan to a specific directory or file:
 ```bash
 python3 scripts/agent_learning.py audit-rules --path /path/to/dir-or-file
 ```
+
+Pass `--baseline <previous-audit.json>` for a changed-target comparison. The JSON
+includes file hashes, word/line counts, word deltas and removed files; unchanged
+pairs are omitted. This lexical scan does not establish semantic usefulness or
+check effectiveness. See the existing weekly audit for bounded follow-up.
 
 ## Review Skill Hooks
 
@@ -401,23 +426,33 @@ flowchart LR
 
 ## Automations
 
-The active Codex automations should use the prompt files under `automations/`:
+The active Codex automations use the prompt files under
+[`automations/`](automations/README.md):
 
 - `agent-learning-midnight-consolidation` at `00:00` Europe/Rome;
 - `agent-learning-morning-review-email` at `08:30` Europe/Rome;
 - `agent-learning-noon-consolidation` at `12:00` Europe/Rome;
-- `agent-learning-weekly-rule-audit` weekly before template apply;
+- weekly rule discovery inside the first consolidation of the week, with a
+  persistent issue registry and recovery on a later consolidation;
+- `agent-learning-weekly-release-pr` every Monday at `10:30` Europe/Rome,
+  after the rule audit;
 - `agent-template-weekly-upstream-apply` weekly in the template repository.
 
-These automations are stored under `~/.codex/automations/` after Codex creates
-them. The shell installer also writes these records directly so a normal
-`./install.sh` run activates the daily loop without a separate manual Codex
-step. Use
+Configure three ordinary schedules in one project chat and the release task in a
+separate project chat. The shell installer does not create or modify Codex
+scheduled tasks. Follow the project and chat setup in
+[`automations/README.md`](automations/README.md), and use
 [`docs/auto-learning-pipeline-automations.md`](docs/auto-learning-pipeline-automations.md)
 for the full two-repository setup.
 
-This automation flow follows the prompt files in `automations/` and the
-notification behavior in `scripts/agent_learning.py notify`.
+The consolidation schedules share `automations/consolidation.md`. The pipeline
+keeps run status and open issues under the store's `state/pipeline.json`, while
+reports retain immutable audit snapshots and verification evidence. The morning
+digest includes described decisions/options and local chat links, plus relevant
+operational failures. It sends readable HTML and plain text, suppresses unchanged
+items for seven days and requires delivery receipts before acknowledging a send.
+Technical findings remain input for consolidation. See the
+[scheduled pipeline contract](skills/consolidate-agent-learnings/references/pipeline.md).
 
 ```mermaid
 flowchart LR
@@ -425,16 +460,18 @@ flowchart LR
   accDescr: Shows consolidation and review email automation paths.
   midnight["00:00 consolidation"] --> consolidate["Process inbox and reviews"]
   noon["12:00 consolidation"] --> consolidate
-  consolidate --> promote["Promote safe lessons"]
+  consolidate --> weekly_due{"Weekly discovery due?"}
+  weekly_due -->|Yes| audit["Discover and persist instruction issues"]
+  weekly_due -->|No| promote["Consolidate notes and open issues"]
+  audit --> promote
   promote --> draft["Create approved-review template drafts when useful"]
-  promote --> report["Write report and validate"]
-  weekly["Weekly rule audit"] --> audit["Check duplicates and conflicts"]
+  promote --> report["Verify changed targets and record outcome"]
   draft --> template["Weekly template upstream apply"]
   template --> refresh["Write out-of-sync report"]
-  morning["08:30 review email"] --> pending{"Pending reviews?"}
+  morning["08:30 digest"] --> pending{"New decisions, errors or reminder due?"}
   pending -->|No| quiet["Do not send email"]
   pending -->|Yes| gmail{"Gmail connector available?"}
-  gmail -->|Yes| send_gmail["Send concise review email"]
+  gmail -->|Yes| send_gmail["Send HTML and plain text, then acknowledge receipt"]
   gmail -->|No| send_msmtp["Use notify --send-msmtp"]
 ```
 
@@ -443,11 +480,14 @@ uses the local `msmtp` fallback through `scripts/agent_learning.py notify`.
 
 ## Validation
 
+Run `bash scripts/check.sh` for the same validation used by the installer and
+GitHub Actions. It uses `$HOME/.markdownlint.json` when available, otherwise the
+versioned config; `MARKDOWNLINT_CONFIG` selects a config explicitly. CI uses
+Node.js 22, Python 3.13, Markdownlint CLI 0.50.0 and ShellCheck on Ubuntu 24.04.
+Local execution needs those tools on `PATH` and a POSIX Python runtime.
+
 Run:
 
 ```bash
-markdownlint --config ~/.markdownlint.json AGENTS.md CHANGELOG.md README.md docs/*.md skills/**/*.md automations/*.md
-shellcheck --enable=all install.sh
-python3 -m py_compile scripts/agent_learning.py tests/test_agent_learning.py
-python3 -m unittest discover -s tests
+bash scripts/check.sh
 ```

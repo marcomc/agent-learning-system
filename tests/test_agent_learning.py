@@ -8,7 +8,10 @@ import sys
 import tempfile
 import time
 import unittest
+from email import policy
+from email.parser import Parser
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -937,11 +940,46 @@ status: "needs-review"
         ):
             module.send_msmtp("reviewer@example.test", "Review needed", "One note")
 
-        self.assertEqual(run.call_args.args[0], ["msmtp", "--read-envelope-from", "-t"])
-        self.assertEqual(
-            run.call_args.kwargs["input"],
-            "To: reviewer@example.test\nSubject: Review needed\n\nOne note\n",
+        self.assertEqual(run.call_args.args[0], ["msmtp", "--", "reviewer@example.test"])
+        message = Parser(policy=policy.default).parsestr(run.call_args.kwargs["input"])
+        self.assertEqual(message["To"], "reviewer@example.test")
+        self.assertEqual(message["Subject"], "Review needed")
+        self.assertEqual(message.get_content().strip(), "One note")
+
+    def test_send_email_uses_explicit_body_file_and_configured_recipient(self) -> None:
+        module = load_agent_learning_module()
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    'AGENT_LEARNING_EMAIL="user@example.test"',
+                    'AGENT_LEARNING_EMAIL="release@example.invalid"',
+                ),
+                encoding="utf-8",
+            )
+            body = directory / "release-email.txt"
+            body.write_text("Release PR: https://example.invalid/pr/1\n", encoding="utf-8")
+            args = SimpleNamespace(config=config, subject="Release v1.2.3", body_file=str(body))
+            with patch.object(module, "send_msmtp") as send:
+                self.assertEqual(module.command_send_email(args), 0)
+
+        send.assert_called_once_with(
+            "release@example.invalid",
+            "Release v1.2.3",
+            "Release PR: https://example.invalid/pr/1\n",
         )
+
+    def test_send_email_rejects_placeholder_recipient(self) -> None:
+        module = load_agent_learning_module()
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            body = directory / "release-email.txt"
+            body.write_text("Release PR\n", encoding="utf-8")
+            args = SimpleNamespace(config=config, subject="Release", body_file=str(body))
+            with self.assertRaisesRegex(SystemExit, "AGENT_LEARNING_EMAIL is not configured"):
+                module.command_send_email(args)
 
     def test_hook_review_skills_only_updates_detected_review_skills(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

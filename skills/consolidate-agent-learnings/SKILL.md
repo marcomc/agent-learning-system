@@ -3,10 +3,15 @@ name: consolidate-agent-learnings
 description: Consolidate Obsidian agent-learning notes by promoting strong reusable lessons into global AGENTS.md, relevant review skills, the touched project AGENTS.md, and agent templates while archiving processed notes.
 ---
 
+<!-- MARCOMC-SKILL: owner="MarcoMC"; repository="marcomc/skills"; provenance="original" -->
+
 # Consolidate Agent Learnings
 
 Use this skill from the scheduled Codex automations or manually when processing
 the Obsidian agent-learning inbox and reviewed `needs-review` notes.
+The owning source is `agent-learning-system/skills/consolidate-agent-learnings`;
+the general skills collection and installed directories carry distribution
+mirrors. Reconcile them after validating the owning source.
 
 ## Guardrails
 
@@ -23,6 +28,11 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
 
 ## Workflow
 
+For scheduled midnight/noon execution, read [pipeline.md](references/pipeline.md)
+first. It owns run coordination, weekly pre-discovery, persistent issues and
+final post-verification. Execute the promotion workflow below within that run;
+reuse the pipeline audit instead of repeating it.
+
 1. Initialize the store:
 
    ```bash
@@ -37,7 +47,18 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
    python3 "${repo}/scripts/agent_learning.py" prepare-run
    ```
 
+   If `pending_finalizations` is nonempty, run `recover-finalizations` and prepare
+   again before processing. It reconciles prepared note/state commits under the
+   store lock; unknown or edited transaction inputs remain an explicit error.
+   Completion reports refuse unresolved finalizations. Read-only notification
+   and audit paths do not recover or modify notes.
+
 1. Process `inbox` notes.
+   - Reconcile the source-run and lesson family with any existing capture.
+     For `application_status: applied`, verify saved targets/evidence and current
+     coverage; archive as already covered when justified, without reapplying it.
+     Stale or incomplete application proof needs investigation, not an assumed
+     promotion. A proposal containing an unresolved user choice stays pending.
    - Promote clear, safe, reusable lessons automatically.
    - Split independent failure domains into bounded rules and targets before
      promotion, retaining every source reference.
@@ -81,6 +102,11 @@ the Obsidian agent-learning inbox and reviewed `needs-review` notes.
    - The touched project's `AGENTS.md` when the lesson is project-local.
    - The existing `update-agents-file-templates` workflow after central or
      project instruction changes when template promotion is useful.
+
+   Resolve and edit owning sources before refreshing installed projections.
+   Product code, CI, hooks, tooling and access changes are separate scoped work;
+   this instruction-consolidation workflow cannot authorize them. Prefer wiring
+   existing checks and tightening established invariants over adding case lists.
 
 1. Finalize each note with the helper:
 

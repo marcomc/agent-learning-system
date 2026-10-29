@@ -38,10 +38,13 @@ personal home path.
 flowchart LR
   review["Review or implementation session"] --> note["Learning note"]
   note --> daily["Daily consolidation"]
+  weekly["Weekly discovery when due"] --> issues["Persistent instruction issues"]
+  issues --> daily
   daily --> route{"Reusable prevention target?"}
   route -->|Local| live["Global, skill, or project AGENTS.md"]
   route -->|Reusable atom| draft[".work/learning-upstream draft"]
-  live --> audit["Weekly rule audit"]
+  live --> audit["Scoped post-verification"]
+  audit --> issues
   draft --> template["Weekly template upstream apply"]
   template --> atoms["Curated template atoms"]
   atoms --> refresh["Out-of-sync report"]
@@ -55,12 +58,14 @@ flowchart LR
 | `agent-learning-midnight-consolidation` | `agent-learning-system` | Daily at midnight | `automations/midnight-consolidation.md` | Process inbox and reviewed notes |
 | `agent-learning-noon-consolidation` | `agent-learning-system` | Daily at noon | `automations/noon-consolidation.md` | Catch daytime notes and reviewed decisions |
 | `agent-learning-morning-review-email` | `agent-learning-system` | Daily morning | `automations/morning-review-email.md` | Notify only when `needs-review/` has work |
-| `agent-learning-weekly-rule-audit` | `agent-learning-system` | Weekly before template apply | `automations/weekly-rule-audit.md` | Detect duplicate, conflicting, or bloated installed rules |
-| `agent-template-weekly-upstream-apply` | `agents-file-templates-and-skills` | Weekly after rule audit | `automations/template-weekly-upstream-apply.md` | Apply only approved clean template drafts and write refresh reports |
+| Weekly discovery phase | `agent-learning-system` | First consolidation of the week; no separate schedule | `automations/weekly-rule-audit.md` | Discover persistent instruction issues before promotion |
+| `agent-learning-weekly-release-pr` | `agent-learning-system` | Monday 10:30 after audit | `automations/weekly-release-pr.md` | Prepare and review a release PR; the user approves and merges |
+| `agent-template-weekly-upstream-apply` | `agents-file-templates-and-skills` | Weekly after rule audit | `${AGENT_TEMPLATE_REPO}/automations/template-weekly-upstream-apply.md` | Apply only approved clean template drafts and write refresh reports |
 
-The learning installer writes the daily learning automations. The weekly rule
-audit and template upstream automation are Codex automations that an agent
-should create or update explicitly if missing.
+The learning installer prints setup guidance but does not create or rewrite
+scheduled tasks. Configure the three ordinary schedules in one project chat and the
+release task in a separate project chat. Configure the template task separately
+in the template project. See [chat setup](../automations/README.md#set-up-the-project-and-chats).
 
 ## Install Checklist
 
@@ -121,12 +126,12 @@ should create or update explicitly if missing.
    - prefer updating an existing matching automation over creating a duplicate;
    - use `local` execution for these jobs;
    - use the matching repository as the automation cwd;
-   - keep active jobs `ACTIVE`;
+   - keep the four schedules active and retire the old standalone weekly audit;
    - preserve existing model and reasoning settings unless they are clearly
      wrong;
    - load prompt text from the prompt source files above;
-   - do not hand-edit scheduler records except through `install.sh` for the
-     daily learning automations.
+   - configure recurring tasks in the appropriate existing project chat;
+   - use the Codex scheduler rather than editing scheduler records by hand.
 
 6. Ensure the template weekly job keeps curated edits gated:
 
@@ -182,6 +187,6 @@ make validate
 | Learning notes never affect templates | Confirm `create-template-draft` runs during consolidation and the weekly template job exists |
 | Template edits leak private data | Require `Privacy verdict: clean` and run `scripts/privacy_scan.py` |
 | Templates change without review | Weekly template job applies only `approved` and `clean` drafts |
-| Same mistake repeats after promotion | Check weekly rule audit plus `summarize-runs` recurrence output |
+| Same mistake repeats after promotion | Consume weekly issues in consolidation and verify affected targets after changes |
 | Generated projects go stale | Review `.work/out-of-sync/` after template apply |
-| Automation commits unexpectedly | Prompt every automation with no stage, commit, push, or PR side effects |
+| Automation commits unexpectedly | Only release preparation owns commit/push/PR actions; consolidation and digest do not |

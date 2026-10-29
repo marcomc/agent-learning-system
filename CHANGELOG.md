@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 The project follows semantic versioning.
 
+## Unreleased
+
+## [1.2.0] - 2026-10-27
+
+### Added
+
+- Coordinated consolidation cycles with integrated weekly discovery, persistent
+  audit findings, scoped post-verification and recoverable run outcomes.
+- Readable HTML/plain-text decision digests with described options, verified
+  local chat links, seven-day reminder suppression and delivery receipts.
+- File-backed Codex automation prompts and setup guidance for shared task chats,
+  including a post-audit release workflow requiring user approval and merge.
+- Idempotent terminal capture by project, source run and lesson family, retaining
+  separate recurrence evidence across runs, rejecting conflicting retries and
+  recovering interrupted note/index commits without duplicate captures.
+- Proposed/applied learning state with target and verification-artifact hashes;
+  consolidation verifies already-applied coverage instead of repeating it.
+- Audit snapshots and changed-target comparisons with size deltas, explicitly
+  separate from semantic approval and check-effectiveness assessment.
+- Shared validation entrypoint used by installer and versioned GitHub Actions,
+  with concurrency, negative-path, archival and audit regressions.
+- Optional independent Retro/Auto Learn comparison and bounded weekly process
+  maintenance without adding an automatic review gate or retrospective loop.
+
+### Fixed
+
+- Revalidate every finalization source while locked, preventing concurrent
+  callers from recreating a note already moved by another finalizer.
+- Reject queue/archive directories resolving outside the configured store,
+  including directory-symlink source and destination escapes.
+- Atomically replace finalization content and journal note/state commits for
+  recovery after process interruption. Surface unfinished commits in preparation
+  output and reject completion reports until they are reconciled.
+
 ## [1.1.0] - 2026-10-26
 
 ### Added

@@ -58,6 +58,8 @@ omitted copies; list additional custom roots in `skill_roots`. Only
 array as installation-only configuration. Verify that each existing binding
 resolves to the owning template repository and include its hash and reviewed
 value in `files`; preserving a config file alone does not validate its binding.
+Root skill-directory links and file links are supported; internal directory
+symlinks are rejected because their contents cannot be certified by this verifier.
 Cache directories are excluded;
 unexpected payload files fail parity. Known intentional private overrides need
 a separate disposition and cannot be called complete source parity.

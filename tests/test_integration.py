@@ -96,6 +96,32 @@ class IntegrationTests(unittest.TestCase):
         (self.copy / "extra.py").write_text("unexpected = True\n")
         self.assertEqual(self.record(), 2)
 
+    def test_internal_directory_symlinks_cannot_certify_complete_payloads(self):
+        self.assertEqual(self.record(), 0)
+        for root in [self.source, self.copy]:
+            with self.subTest(root=root):
+                external = self.directory / (root.parent.name + "-references")
+                external.mkdir()
+                (external / "rule.md").write_text("Unverified instructions.\n")
+                link = root / "references"
+                link.symlink_to(external, target_is_directory=True)
+                self.assertEqual(self.record(), 2)
+                self.assertEqual(self.command("integration-audit", "--require-verified")[0], 1)
+                link.unlink()
+        self.assertEqual(self.command("integration-audit", "--require-verified")[0], 0)
+
+    def test_root_and_file_symlinks_remain_supported_and_track_drift(self):
+        linked_root = self.directory / "runtime-link"
+        linked_root.symlink_to(self.copy, target_is_directory=True)
+        self.manifest["skills"][0]["copies"] = [str(linked_root)]
+        linked_file = self.directory / "helper-source.py"
+        linked_file.write_bytes((self.source / "helper.py").read_bytes())
+        (self.source / "helper.py").unlink()
+        (self.source / "helper.py").symlink_to(linked_file)
+        self.assertEqual(self.record(), 0)
+        linked_file.write_text("safe = False\n")
+        self.assertEqual(self.command("integration-audit", "--require-verified")[0], 1)
+
     def test_draft_and_missing_rule_cannot_be_called_integrated(self):
         self.manifest["template_status"] = "draft-created"
         self.assertEqual(self.record(), 2)

@@ -45,6 +45,8 @@ def tree(root: Path, local_files: list[str]) -> dict[str, str]:
             continue
         if path.is_symlink() and not path.exists():
             raise ValueError(f"Broken payload link: {path}")
+        if path.is_symlink() and path.is_dir():
+            raise ValueError(f"Directory symlinks inside skill payloads are unsupported: {path}")
         if path.is_file():
             result[str(relative)] = digest(path)
     return result

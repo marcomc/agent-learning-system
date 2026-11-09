@@ -2140,13 +2140,13 @@ def command_integration(args: argparse.Namespace) -> int:
         with state_update_lock(root):
             state = load_state(root)
             entries = integration_entries(root, state, manifest["note_ids"])
-            covered_files = set(verified["files"])
+            covered_files = set(verified["files"]) | set(verified["generated"])
             for skill_root, payload in verified["skills"].items():
                 covered_files.update(str(Path(skill_root) / name) for name in payload)
             for entry in entries:
                 for raw in entry.get("prevention_targets", []) + entry.get("detection_targets", []):
-                    value = raw.split(":", 1)[1] if ":" in raw else raw
-                    if Path(value).is_absolute() and str(Path(value).resolve()) not in covered_files:
+                    target = concrete_routing_target_path(raw)
+                    if target is not None and str(target) not in covered_files:
                         raise ConfigError(f"Integration omitted a recorded concrete target: {raw}")
             if any(e.get("template_upstream_status") in {"draft-created", "deferred"} for e in entries):
                 if manifest.get("template_status") != "promoted":

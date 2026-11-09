@@ -184,6 +184,23 @@ class IntegrationTests(unittest.TestCase):
         self.app.save_state(self.root, state)
         self.assertEqual(self.record(), 2)
 
+    def test_home_relative_targets_require_coverage_and_revalidate_drift(self):
+        target = self.directory / "AGENTS.md"
+        target.write_text("# Instructions\n\nPreserve evidence.\n")
+        state = self.app.load_state(self.root)
+        state["processed"]["note-1"].update(
+            prevention_targets=["~/AGENTS.md"],
+            detection_targets=["skill:~/AGENTS.md"],
+        )
+        self.app.save_state(self.root, state)
+        with patch.dict("os.environ", {"HOME": str(self.directory)}):
+            self.assertEqual(self.record(), 2)
+            self.manifest["files"].append({**self.app.snapshot(str(target)),
+                                           "contains": ["Preserve evidence."]})
+            self.assertEqual(self.record(), 0)
+            target.write_text("# Instructions\n\nChanged guidance.\n")
+            self.assertEqual(self.command("integration-audit", "--require-verified")[0], 1)
+
     def test_template_integration_rejects_stale_consumers_and_unavailable_roots(self):
         import learning_integration
         repo = self.directory / "templates"
@@ -194,6 +211,9 @@ class IntegrationTests(unittest.TestCase):
         project.mkdir()
         output = project / "AGENTS.md"
         output.write_text("GENERATED\nPreserve evidence.\n")
+        state = self.app.load_state(self.root)
+        state["processed"]["note-1"]["prevention_targets"] = [str(output)]
+        self.app.save_state(self.root, state)
         self.manifest["files"].append({**self.app.snapshot(str(template)), "contains": ["Preserve evidence."]})
         self.manifest["template_status"] = "promoted"
         self.manifest["template_consumers"] = [{"repository": str(repo), "roots": [str(project)], "template_ids": ["python"]}]

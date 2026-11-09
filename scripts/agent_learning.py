@@ -742,7 +742,8 @@ def ensure_review_block(body: str) -> str:
 
 def note_summary(path: Path, raw: bytes | None = None) -> dict[str, str]:
     raw = path.read_bytes() if raw is None else raw
-    fm, body = parse_frontmatter(raw.decode("utf-8"))
+    text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    fm, body = parse_frontmatter(text)
     decision, checked = checkbox_decision(body)
     return {
         "path": str(path),

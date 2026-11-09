@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -100,6 +101,31 @@ class PipelineTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.app.command_finalize_note(args)
             self.pipeline.finish("inbox-run", "completed", "Verified", str(self.report), [])
+
+    def test_inventory_preserves_note_identity_across_supported_newlines(self):
+        for index, newline in enumerate(["\n", "\r\n", "\r"]):
+            with self.subTest(newline=repr(newline)):
+                note_id = f"actual-id-{index}"
+                run_id = f"newline-run-{index}"
+                inbox = self.root / "inbox" / f"different-filename-{index}.md"
+                text = f'---\nid: "{note_id}"\nstatus: "inbox"\ncreated_at: "2026-01-01T00:00:00+00:00"\nproject_path: "/example/project"\n---\n# Source\n'
+                raw = text.replace("\n", newline).encode()
+                inbox.write_bytes(raw)
+                summary = self.app.note_summary(inbox)
+                self.assertEqual(summary["id"], note_id)
+                self.assertEqual(summary["project_path"], "/example/project")
+                self.assertEqual(summary["created_at"], "2026-01-01T00:00:00+00:00")
+                self.assertEqual(summary["sha256"], hashlib.sha256(raw).hexdigest())
+                with patch.object(self.app, "pipeline_inventory", return_value=[]):
+                    args = self.app.build_parser().parse_args(["--config", str(self.config), "pipeline-begin", "--run-id", run_id, "--runner", "noon"])
+                    with redirect_stdout(io.StringIO()):
+                        self.app.command_pipeline(args)
+                self.assertEqual(self.pipeline.status()["runs"][run_id]["initial_inbox"][0]["id"], note_id)
+                self.pipeline.audit(run_id, self.audit_payload(False), [], True)
+                args = self.app.build_parser().parse_args(["--config", str(self.config), "finalize-note", "--file", str(inbox), "--status", "processed", "--rationale", "Covered by current evidence."])
+                with redirect_stdout(io.StringIO()):
+                    self.app.command_finalize_note(args)
+                self.pipeline.finish(run_id, "completed", "Verified", str(self.report), [])
 
     def test_inbox_cohorts_are_hints_and_do_not_combine_empty_identity(self):
         notes = [

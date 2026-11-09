@@ -774,11 +774,12 @@ def read_note_bounded(path: Path) -> bytes:
     return result.stdout
 
 
-def bounded_note_inventory(paths: list[Path]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def bounded_note_inventory(root: Path, paths: list[Path]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     def inspect(path: Path) -> tuple[dict[str, str] | None, dict[str, str] | None]:
         try:
-            return note_summary(path, read_note_bounded(path)), None
-        except (OSError, UnicodeError, subprocess.CalledProcessError):
+            resolved = validate_note_source(root, path)
+            return note_summary(path, read_note_bounded(resolved)), None
+        except (ConfigError, OSError, UnicodeError, subprocess.CalledProcessError):
             return None, {"path": str(path), "reason": "unavailable or unreadable"}
     with ThreadPoolExecutor(max_workers=8) as executor:
         results = list(executor.map(inspect, paths))
@@ -861,8 +862,8 @@ def command_prepare_run(args: argparse.Namespace) -> int:
     root = learning_root(config)
     ensure_store(root)
     with state_update_lock(root):
-        inbox, unavailable_inbox = bounded_note_inventory(sorted((root / "inbox").glob("*.md")))
-        review, unavailable_review = bounded_note_inventory(sorted((root / "needs-review").glob("*.md")))
+        inbox, unavailable_inbox = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")))
+        review, unavailable_review = bounded_note_inventory(root, sorted((root / "needs-review").glob("*.md")))
         payload = {
             "run_id": datetime.now().strftime("%Y%m%d-%H%M%S"),
             "learning_root": str(root),
@@ -1520,14 +1521,14 @@ def learning_upstream_draft_markdown(
 
 
 def pending_review_notes(root: Path) -> list[dict[str, str]]:
-    notes, unavailable = bounded_note_inventory(sorted((root / "needs-review").glob("*.md")))
+    notes, unavailable = bounded_note_inventory(root, sorted((root / "needs-review").glob("*.md")))
     if unavailable:
         raise ConfigError("Review inventory is incomplete; retry unavailable notes before notification.")
     return [note for note in notes if note["review_decision"] in {"pending", "ambiguous"}]
 
 
 def inbox_notes(root: Path) -> list[dict[str, str]]:
-    notes, unavailable = bounded_note_inventory(sorted((root / "inbox").glob("*.md")))
+    notes, unavailable = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")))
     if unavailable:
         raise ConfigError("Inbox inventory is incomplete; retry unavailable notes before notification.")
     return notes
@@ -1666,7 +1667,7 @@ def command_pipeline(args: argparse.Namespace) -> int:
     elif operation == "pipeline-status":
         result = pipeline.status()
     elif operation == "pipeline-begin":
-        initial_inbox, unavailable = bounded_note_inventory(sorted((root / "inbox").glob("*.md")))
+        initial_inbox, unavailable = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")))
         result = pipeline.begin(args.run_id, args.runner, pipeline_inventory(root),
                                 [{"id": n["id"], "path": n["path"], "sha256": n["sha256"]}
                                  for n in initial_inbox], unavailable)
@@ -1690,7 +1691,7 @@ def command_pipeline(args: argparse.Namespace) -> int:
                 run = pipeline.active(pipeline.load(), args.run_id)
                 require_run_integrations(root, run)
             for folder in ("inbox", "needs-review"):
-                _, unavailable = bounded_note_inventory(sorted((root / folder).glob("*.md")))
+                _, unavailable = bounded_note_inventory(root, sorted((root / folder).glob("*.md")))
                 if unavailable:
                     raise ConfigError("Current note inventory is incomplete; completion is not verified.")
         inventory = pipeline_inventory(root) if args.status == "completed" else None

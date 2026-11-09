@@ -158,6 +158,32 @@ project_path: "/tmp/project"
             payload = json.loads(result.stdout)
             self.assertEqual(payload["needs_review"][0]["review_decision"], "approved")
 
+    def test_inventory_rejects_external_symlinks_without_reading_content(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            external = directory / "private.md"
+            external.write_text('---\nid: "outside"\n---\n# PRIVATE_TITLE\n')
+            for folder in ["inbox", "needs-review"]:
+                with self.subTest(folder=folder):
+                    link = root / folder / "linked.md"
+                    link.symlink_to(external)
+                    result = self.run_helper(config, "prepare-run")
+                    payload = json.loads(result.stdout)
+                    self.assertFalse(payload["inventory_complete"])
+                    self.assertNotIn("PRIVATE_TITLE", result.stdout)
+                    self.assertEqual(payload["unavailable_sources"][0]["path"], str(link))
+                    app = load_agent_learning_module()
+                    with patch.object(app, "read_note_bounded") as reader:
+                        notes, unavailable = app.bounded_note_inventory(root, [link])
+                    reader.assert_not_called()
+                    self.assertEqual(notes, [])
+                    self.assertEqual(len(unavailable), 1)
+                    with self.assertRaises(app.ConfigError):
+                        (app.inbox_notes if folder == "inbox" else app.pending_review_notes)(root)
+                    link.unlink()
+
     def test_finalize_note_is_idempotent_in_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config = self.write_config(Path(raw))

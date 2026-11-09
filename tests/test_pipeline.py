@@ -129,7 +129,7 @@ class PipelineTests(unittest.TestCase):
         bad.write_text('---\nid: "bad"\nstatus: "inbox"\n---\n# Bad\n')
         real = self.app.read_note_bounded
         def read(path):
-            if path == bad:
+            if path.resolve() == bad.resolve():
                 raise TimeoutError("stalled")
             return real(path)
         args = self.app.build_parser().parse_args(["--config", str(self.config), "prepare-run"])

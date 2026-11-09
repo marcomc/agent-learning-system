@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -85,6 +86,90 @@ class PipelineTests(unittest.TestCase):
             self.pipeline.finish("run-1", "completed", "Done", str(self.report), [])
         self.pipeline.audit("run-1", self.audit_payload(False), [], False)
         self.pipeline.finish("run-1", "completed", "Verified", str(self.report), [str(self.target)])
+
+    def test_completion_requires_the_initial_inbox_to_be_accounted_for(self):
+        inbox = self.root / "inbox" / "source.md"
+        inbox.write_text('---\nid: "source-1"\nstatus: "inbox"\n---\n# Source\n')
+        with patch.object(self.app, "pipeline_inventory", return_value=[]):
+            args = self.app.build_parser().parse_args(["--config", str(self.config), "pipeline-begin", "--run-id", "inbox-run", "--runner", "noon"])
+            with redirect_stdout(io.StringIO()):
+                self.app.command_pipeline(args)
+            self.pipeline.audit("inbox-run", self.audit_payload(False), [], True)
+            with self.assertRaisesRegex(ValueError, "initial inbox"):
+                self.pipeline.finish("inbox-run", "completed", "Done", str(self.report), [])
+            args = self.app.build_parser().parse_args(["--config", str(self.config), "finalize-note", "--file", str(inbox), "--status", "processed", "--rationale", "Already covered by the verified instruction."])
+            with redirect_stdout(io.StringIO()):
+                self.app.command_finalize_note(args)
+            self.pipeline.finish("inbox-run", "completed", "Verified", str(self.report), [])
+
+    def test_inventory_preserves_note_identity_across_supported_newlines(self):
+        for index, newline in enumerate(["\n", "\r\n", "\r"]):
+            with self.subTest(newline=repr(newline)):
+                note_id = f"actual-id-{index}"
+                run_id = f"newline-run-{index}"
+                inbox = self.root / "inbox" / f"different-filename-{index}.md"
+                text = f'---\nid: "{note_id}"\nstatus: "inbox"\ncreated_at: "2026-01-01T00:00:00+00:00"\nproject_path: "/example/project"\n---\n# Source\n'
+                raw = text.replace("\n", newline).encode()
+                inbox.write_bytes(raw)
+                summary = self.app.note_summary(inbox)
+                self.assertEqual(summary["id"], note_id)
+                self.assertEqual(summary["project_path"], "/example/project")
+                self.assertEqual(summary["created_at"], "2026-01-01T00:00:00+00:00")
+                self.assertEqual(summary["sha256"], hashlib.sha256(raw).hexdigest())
+                with patch.object(self.app, "pipeline_inventory", return_value=[]):
+                    args = self.app.build_parser().parse_args(["--config", str(self.config), "pipeline-begin", "--run-id", run_id, "--runner", "noon"])
+                    with redirect_stdout(io.StringIO()):
+                        self.app.command_pipeline(args)
+                self.assertEqual(self.pipeline.status()["runs"][run_id]["initial_inbox"][0]["id"], note_id)
+                self.pipeline.audit(run_id, self.audit_payload(False), [], True)
+                args = self.app.build_parser().parse_args(["--config", str(self.config), "finalize-note", "--file", str(inbox), "--status", "processed", "--rationale", "Covered by current evidence."])
+                with redirect_stdout(io.StringIO()):
+                    self.app.command_finalize_note(args)
+                self.pipeline.finish(run_id, "completed", "Verified", str(self.report), [])
+
+    def test_inbox_cohorts_are_hints_and_do_not_combine_empty_identity(self):
+        notes = [
+            {"id": "a", "project_path": "/project", "source_run_id": "run", "lesson_family": "one", "created_at": "2026-01-01"},
+            {"id": "b", "project_path": "/project", "source_run_id": "run", "lesson_family": "two", "created_at": "2026-01-02"},
+            {"id": "c", "project_path": "", "source_run_id": "", "lesson_family": "", "created_at": "2026-01-03"},
+            {"id": "d", "project_path": "", "source_run_id": "", "lesson_family": "", "created_at": "2026-01-04"},
+        ]
+        analysis = self.app.inbox_analysis(notes)
+        self.assertEqual(analysis["candidate_cohorts"][0]["note_ids"], ["a", "b"])
+        self.assertIn("hints", analysis["notice"])
+        review = [{"id": "e", "project_path": "/project", "source_run_id": "run", "created_at": "2026-01-03", "review_decision": "pending"}]
+        joined = self.app.inbox_analysis(notes, review)["candidate_cohorts"][0]
+        self.assertEqual(joined["note_ids"], ["a", "b", "e"])
+        self.assertEqual(joined["review_note_ids"], ["e"])
+        review.append({"id": "f", "project_path": "/project", "source_run_id": "other", "created_at": "2026-01-04", "review_decision": "pending"})
+        review.append({"id": "g", "project_path": "/project", "source_run_id": "run", "created_at": "2026-01-05", "review_decision": "approved"})
+        context = self.app.inbox_analysis(notes, review)["candidate_contexts"][0]
+        self.assertEqual(context["review_note_ids"], ["e", "f"])
+        self.assertNotIn("g", context["note_ids"])
+
+    def test_preparation_keeps_readable_notes_and_reports_inaccessible_sources(self):
+        inbox = self.root / "inbox"
+        good = inbox / "good.md"
+        bad = inbox / "bad.md"
+        good.write_text('---\nid: "good"\nstatus: "inbox"\n---\n# Good\n')
+        bad.write_text('---\nid: "bad"\nstatus: "inbox"\n---\n# Bad\n')
+        real = self.app.read_note_bounded
+        def read(path):
+            if path.resolve() == bad.resolve():
+                raise TimeoutError("stalled")
+            return real(path)
+        args = self.app.build_parser().parse_args(["--config", str(self.config), "prepare-run"])
+        out = io.StringIO()
+        with patch.object(self.app, "read_note_bounded", side_effect=read), redirect_stdout(out):
+            self.app.command_prepare_run(args)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["inventory_complete"])
+        self.assertEqual([n["id"] for n in payload["inbox"]], ["good"])
+        self.assertEqual(payload["unavailable_sources"][0]["path"], str(bad))
+        self.pipeline.begin("unavailable-run", "noon", [], [], payload["unavailable_sources"])
+        self.pipeline.audit("unavailable-run", self.audit_payload(False), [], True)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.pipeline.finish("unavailable-run", "completed", "Done", str(self.report), [])
 
     def test_audit_refresh_keeps_a_pending_decision_and_its_options(self):
         self.pipeline.begin("run-1", "midnight")
@@ -242,6 +327,8 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("\nForged heading", digest["body"])
         self.assertIn("codex://threads/" + ORDINARY, digest["html"])
         self.assertIn("codex://threads/" + ORDINARY, digest["body"])
+        self.assertIn("open 'codex://threads/" + ORDINARY + "'", digest["body"])
+        self.assertIn("Open the chat to respond", digest["html"])
         self.assertIn("Discard", digest["html"])
         self.assertIn("Discard", digest["body"])
         self.assertIn("line-height:1.6", digest["html"])
@@ -279,6 +366,41 @@ class PipelineTests(unittest.TestCase):
         self.pipeline.audit("run-2", self.audit_payload(False), [], True)
         self.pipeline.finish("run-2", "completed", "Verified", str(self.report), [])
         self.assertIsNone(self.pipeline.digest(self.pipeline.status(), self.notes()))
+
+    def test_digest_reports_old_inbox_and_revalidates_it_before_reservation(self):
+        self.note.unlink()
+        now = datetime.now().astimezone()
+        inbox = [{"id": "old", "created_at": (now - timedelta(days=2)).isoformat()}]
+        digest = self.pipeline.digest(self.pipeline.status(), [], now, inbox=inbox)
+        self.assertIn("1", digest["body"])
+        self.assertIn("inbox", digest["body"].lower())
+        with self.assertRaisesRegex(ValueError, "inputs changed"):
+            self.pipeline.reserve(digest, lambda state: self.pipeline.digest(state, [], now, inbox=[]))
+        self.assertIsNone(self.pipeline.digest(self.pipeline.status(), [], now, inbox=[
+            {"id": "new", "created_at": now.isoformat()}
+        ]))
+        unknown = self.pipeline.digest(self.pipeline.status(), [], now, inbox=[
+            {"id": "invalid", "created_at": "not-a-date"}
+        ])
+        self.assertIn("unknown creation time", unknown["body"])
+
+    def test_notification_body_reads_inbox_without_review_notes(self):
+        self.note.unlink()
+        (self.root / "inbox" / "old.md").write_text(
+            '---\nid: "inbox-1"\ncreated_at: "2020-01-01T00:00:00+00:00"\n'
+            'status: "inbox"\n---\n# Pending\n'
+        )
+        payload = self.app.notification_body({}, self.root)
+        self.assertIsNotNone(payload)
+        self.assertIn("1 inbox note", payload[1])
+
+    def test_notification_does_not_reserve_an_incomplete_inventory(self):
+        self.pipeline.update_issue(self.decision())
+        args = self.app.build_parser().parse_args(["--config", str(self.config), "notify", "--prepare"])
+        with patch.object(self.app, "read_note_bounded", side_effect=TimeoutError("stalled")):
+            with self.assertRaisesRegex(self.app.ConfigError, "inventory is incomplete"):
+                self.app.command_notify(args)
+        self.assertIsNone(self.pipeline.status()["outbox"])
 
     def test_msmtp_failure_preserves_the_pending_submission(self):
         self.pipeline.update_issue(self.decision())

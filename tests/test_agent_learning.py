@@ -158,6 +158,32 @@ project_path: "/tmp/project"
             payload = json.loads(result.stdout)
             self.assertEqual(payload["needs_review"][0]["review_decision"], "approved")
 
+    def test_inventory_rejects_external_symlinks_without_reading_content(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            external = directory / "private.md"
+            external.write_text('---\nid: "outside"\n---\n# PRIVATE_TITLE\n')
+            for folder in ["inbox", "needs-review"]:
+                with self.subTest(folder=folder):
+                    link = root / folder / "linked.md"
+                    link.symlink_to(external)
+                    result = self.run_helper(config, "prepare-run")
+                    payload = json.loads(result.stdout)
+                    self.assertFalse(payload["inventory_complete"])
+                    self.assertNotIn("PRIVATE_TITLE", result.stdout)
+                    self.assertEqual(payload["unavailable_sources"][0]["path"], str(link))
+                    app = load_agent_learning_module()
+                    with patch.object(app, "read_note_bounded") as reader:
+                        notes, unavailable = app.bounded_note_inventory(root, [link])
+                    reader.assert_not_called()
+                    self.assertEqual(notes, [])
+                    self.assertEqual(len(unavailable), 1)
+                    with self.assertRaises(app.ConfigError):
+                        (app.inbox_notes if folder == "inbox" else app.pending_review_notes)(root)
+                    link.unlink()
+
     def test_finalize_note_is_idempotent_in_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config = self.write_config(Path(raw))
@@ -945,6 +971,32 @@ status: "needs-review"
         self.assertEqual(message["To"], "reviewer@example.test")
         self.assertEqual(message["Subject"], "Review needed")
         self.assertEqual(message.get_content().strip(), "One note")
+
+    def test_digest_mime_preserves_codex_link_in_both_alternatives(self) -> None:
+        module = load_agent_learning_module()
+        link = "codex://threads/11111111-1111-1111-1111-111111111111"
+        with (patch.object(module.shutil, "which", return_value="/usr/local/bin/msmtp"),
+              patch.object(module.subprocess, "run") as run):
+            module.send_msmtp("reviewer@example.test", "Review", "Open " + link,
+                              '<a href="' + link + '">Open</a>')
+        message = Parser(policy=policy.default).parsestr(run.call_args.kwargs["input"])
+        parts = list(message.iter_parts())
+        self.assertEqual([part["Content-Transfer-Encoding"] for part in parts], ["base64", "base64"])
+        self.assertTrue(all(link in part.get_content() for part in parts))
+
+    def test_digest_uses_explicit_sender_for_header_and_envelope(self) -> None:
+        module = load_agent_learning_module()
+        with (patch.object(module.shutil, "which", return_value="/usr/local/bin/msmtp"),
+              patch.object(module.subprocess, "run") as run):
+            module.send_msmtp("recipient@example.test", "Review", "Body", "",
+                              "sender+learning@example.test")
+            self.assertEqual(run.call_args.args[0], ["msmtp", "--from", "sender+learning@example.test",
+                                                     "--", "recipient@example.test"])
+            message = Parser(policy=policy.default).parsestr(run.call_args.kwargs["input"])
+            self.assertEqual(message["From"], "sender+learning@example.test")
+            with self.assertRaises(module.ConfigError):
+                module.send_msmtp("recipient@example.test", "Review", "Body", "", "bad\nBcc: x@example.test")
+            self.assertEqual(run.call_count, 1)
 
     def test_send_email_uses_explicit_body_file_and_configured_recipient(self) -> None:
         module = load_agent_learning_module()

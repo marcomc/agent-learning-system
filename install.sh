@@ -140,6 +140,7 @@ skill_mode_value=$(quote_env "${SKILL_MODE}")
   printf 'AGENT_LEARNING_SKILL_MODE=%s\n' "${skill_mode_value}"
   printf 'AGENT_LEARNING_AUTONOMOUS_REVIEW="%s"\n' "${AUTONOMOUS_REVIEW}"
   printf 'AGENT_LEARNING_REVIEW_GROUP_THRESHOLD="%s"\n' "${REVIEW_GROUP_THRESHOLD}"
+  printf 'AGENT_LEARNING_REQUIRE_INTEGRATION="1"\n'
 } > "${CONFIG_FILE}"
 
 python3 "${SCRIPT_DIR}/scripts/agent_learning.py" --config "${CONFIG_FILE}" init-store >/dev/null

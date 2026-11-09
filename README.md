@@ -227,9 +227,25 @@ Review notes contain a stable checkbox block:
 <!-- END AGENT LEARNING REVIEW -->
 ```
 
+Archival (`processed`) is separate from verified integration. The
+[integration contract](skills/consolidate-agent-learnings/references/integration.md)
+requires whole-contract coherence review, owning-source coverage, complete
+installed skill parity and refreshed template consumers. Proportionate local,
+peer or council evidence is bound to the exact proposal; distribution-only
+receipts remain historical proof. `integration-audit` revalidates receipts; configured
+`AGENT_LEARNING_REQUIRE_INTEGRATION=1` rejects completed runs with unverified
+newly processed notes. Historical notes without receipts remain unverified.
+
 The consolidator reads `inbox/`, `needs-review/`, and `state/processed.json`.
 It does not reread `processed/` history unless resolving a duplicate or
 conflict.
+
+`prepare-run` groups related inbox and pending-review notes as candidate cohorts
+and project contexts. These are discovery hints: each source still needs its own
+evidence and outcome. Individual reads are bounded; `inventory_complete: false`
+and `unavailable_sources` indicate unknown content, never an empty queue. Runs
+cannot complete when their initial inbox snapshot was incomplete or a captured
+source lacks a recorded finalization.
 
 ## Joint Review and Delegated Resolution
 
@@ -470,13 +486,13 @@ flowchart LR
   template --> refresh["Write out-of-sync report"]
   morning["08:30 digest"] --> pending{"New decisions, errors or reminder due?"}
   pending -->|No| quiet["Do not send email"]
-  pending -->|Yes| gmail{"Gmail connector available?"}
-  gmail -->|Yes| send_gmail["Send HTML and plain text, then acknowledge receipt"]
-  gmail -->|No| send_msmtp["Use notify --send-msmtp"]
+  pending -->|Yes| send_msmtp["Send with notify --send-msmtp"]
 ```
 
-The email automation tries the Gmail connector first. If it is unavailable, it
-uses the local `msmtp` fallback through `scripts/agent_learning.py notify`.
+The email automation uses `notify --send-msmtp`. Set the optional
+`AGENT_LEARNING_EMAIL_FROM` to a sender already verified by the mail provider;
+the recipient remains `AGENT_LEARNING_EMAIL`. Reinstalling rewrites the config,
+so restore the sender setting after an installation.
 
 ## Validation
 

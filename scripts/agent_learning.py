@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from contextlib import contextmanager
 import difflib
@@ -29,6 +30,9 @@ from typing import Any
 # Support direct CLI execution and file-based imports used by the test harness.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from learning_pipeline import Pipeline, chat_url, snapshot
+from learning_integration import verify as verify_integration, validate_receipt
+from learning_integration import verify_distribution
+from learning_coherence import verify_coherence
 
 try:
     import fcntl
@@ -736,12 +740,15 @@ def ensure_review_block(body: str) -> str:
     return body.rstrip() + "\n\n" + REVIEW_BLOCK
 
 
-def note_summary(path: Path) -> dict[str, str]:
-    fm, body = read_note(path)
+def note_summary(path: Path, raw: bytes | None = None) -> dict[str, str]:
+    raw = path.read_bytes() if raw is None else raw
+    text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    fm, body = parse_frontmatter(text)
     decision, checked = checkbox_decision(body)
     return {
         "path": str(path),
         "id": fm.get("id", path.stem),
+        "created_at": fm.get("created_at", ""),
         "title": body.splitlines()[0].lstrip("# ").strip() if body.splitlines() else path.stem,
         "project_path": fm.get("project_path", ""),
         "source_skill": fm.get("source_skill", ""),
@@ -754,8 +761,31 @@ def note_summary(path: Path) -> dict[str, str]:
         "source_run_id": fm.get("source_run_id", ""),
         "applied_targets": fm.get("applied_targets", "[]"),
         "application_evidence": fm.get("application_evidence", ""),
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "sha256": hashlib.sha256(raw).hexdigest(),
     }
+
+
+def read_note_bounded(path: Path) -> bytes:
+    try:
+        result = subprocess.run(["/bin/cat", str(path)], capture_output=True, check=True, timeout=8)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("Note read timed out.") from exc
+    if not result.stdout:
+        raise OSError("Note is empty or not hydrated.")
+    return result.stdout
+
+
+def bounded_note_inventory(root: Path, paths: list[Path]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    def inspect(path: Path) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+        try:
+            resolved = validate_note_source(root, path)
+            return note_summary(path, read_note_bounded(resolved)), None
+        except (ConfigError, OSError, UnicodeError, subprocess.CalledProcessError):
+            return None, {"path": str(path), "reason": "unavailable or unreadable"}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(inspect, paths))
+    return ([note for note, _ in results if note is not None],
+            [failure for _, failure in results if failure is not None])
 
 
 def review_policy(config: dict[str, str]) -> dict[str, Any]:
@@ -798,17 +828,50 @@ def review_analysis(config: dict[str, str], notes: list[dict[str, str]]) -> dict
     }
 
 
+def inbox_analysis(notes: list[dict[str, str]], review: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    groups: dict[tuple[str, str], list[dict[str, str]]] = {}
+    projects: dict[str, list[dict[str, str]]] = {}
+    eligible_review = [n for n in (review or []) if n["review_decision"] == "pending"]
+    review_ids = {n["id"] for n in eligible_review}
+    for note in [*notes, *eligible_review]:
+        project = note.get("project_path", "").strip()
+        source = note.get("source_run_id", "").strip()
+        if project:
+            projects.setdefault(project, []).append(note)
+        if project and source:
+            groups.setdefault((project, source), []).append(note)
+    cohorts = []
+    for (project, source), members in groups.items():
+        if len(members) < 2 or all(n["id"] in review_ids for n in members):
+            continue
+        members.sort(key=lambda n: (n.get("created_at", ""), n["id"]))
+        cohorts.append({"project_path": project, "source_run_id": source,
+                        "note_ids": [n["id"] for n in members],
+                        "review_note_ids": [n["id"] for n in members if n["id"] in review_ids],
+                        "oldest": members[0].get("created_at", "")})
+    cohorts.sort(key=lambda c: (c["oldest"], c["project_path"], c["source_run_id"]))
+    contexts = [{"project_path": project, "note_ids": [n["id"] for n in members],
+                 "review_note_ids": [n["id"] for n in members if n["id"] in review_ids]}
+                for project, members in sorted(projects.items()) if len(members) > 1
+                and not all(n["id"] in review_ids for n in members)]
+    return {"candidate_cohorts": cohorts, "candidate_contexts": contexts,
+            "notice": "Cohorts are discovery hints only; inspect every source and independently verify evidence and decisions."}
+
+
 def command_prepare_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     root = learning_root(config)
     ensure_store(root)
     with state_update_lock(root):
-        inbox = [note_summary(path) for path in sorted((root / "inbox").glob("*.md"))]
-        review = [note_summary(path) for path in sorted((root / "needs-review").glob("*.md"))]
+        inbox, unavailable_inbox = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")))
+        review, unavailable_review = bounded_note_inventory(root, sorted((root / "needs-review").glob("*.md")))
         payload = {
             "run_id": datetime.now().strftime("%Y%m%d-%H%M%S"),
             "learning_root": str(root),
             "inbox": inbox,
+            "inventory_complete": not (unavailable_inbox or unavailable_review),
+            "unavailable_sources": unavailable_inbox + unavailable_review,
+            "inbox_analysis": inbox_analysis(inbox, review),
             "needs_review": review,
             "review_analysis": review_analysis(config, review),
             "pending_finalizations": [str(path) for path in finalization_journals(root)],
@@ -1020,9 +1083,28 @@ def validate_autonomous_review(
         if hashlib.sha256(path.read_bytes()).hexdigest() != target.get("sha256"):
             raise ConfigError("Stale instruction target in autonomous review receipt.")
         verified_targets.add(path)
+    original_fm, _ = read_note(source)
+    original_routing = routing_from_args(argparse.Namespace(), original_fm, body, source)
+    original_paths = {p for value in original_routing["prevention_targets"] + original_routing["detection_targets"]
+                      if (p := concrete_routing_target_path(value)) is not None}
+    implementation_paths: set[Path] = set()
+    implementation_evidence = decision.get("implementation_evidence", [])
+    if not isinstance(implementation_evidence, list):
+        raise ConfigError("Invalid implementation evidence.")
+    project = Path(original_fm.get("project_path", "")).expanduser().resolve()
+    for ref in implementation_evidence:
+        if not isinstance(ref, dict) or not isinstance(ref.get("path"), str):
+            raise ConfigError("Invalid implementation evidence.")
+        path = Path(ref["path"]).expanduser().resolve()
+        if (not original_fm.get("project_path") or not project.is_dir() or project == project.parent
+                or path not in original_paths or not path.is_relative_to(project)
+                or not path.is_file() or instruction_target(path, root)
+                or hashlib.sha256(path.read_bytes()).hexdigest() != ref.get("sha256")):
+            raise ConfigError("Stale or invalid implementation evidence.")
+        implementation_paths.add(path)
     for value in routing["prevention_targets"] + routing["detection_targets"]:
         path = concrete_routing_target_path(value)
-        if path is not None and path not in verified_targets:
+        if path is not None and path not in verified_targets and path not in implementation_paths:
             raise ConfigError("Concrete routing targets must match verified receipt targets.")
     return {
         "review_authority": "autonomous-instructions",
@@ -1076,6 +1158,8 @@ def command_finalize_note(args: argparse.Namespace) -> int:
             "path": str(final), "status": status, "processed_at": fm["processed_at"],
             "rationale": args.rationale, **routing_state_payload(routing), **review_metadata,
         }
+        if status == "processed":
+            entry["integration_status"] = "pending"
         for key in ("capture_key", "capture_digest"):
             if key in fm:
                 entry[key] = fm[key]
@@ -1438,33 +1522,43 @@ def learning_upstream_draft_markdown(
 
 
 def pending_review_notes(root: Path) -> list[dict[str, str]]:
-    notes: list[dict[str, str]] = []
-    for path in sorted((root / "needs-review").glob("*.md")):
-        summary = note_summary(path)
-        if summary["review_decision"] in {"pending", "ambiguous"}:
-            notes.append(summary)
+    notes, unavailable = bounded_note_inventory(root, sorted((root / "needs-review").glob("*.md")))
+    if unavailable:
+        raise ConfigError("Review inventory is incomplete; retry unavailable notes before notification.")
+    return [note for note in notes if note["review_decision"] in {"pending", "ambiguous"}]
+
+
+def inbox_notes(root: Path) -> list[dict[str, str]]:
+    notes, unavailable = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")))
+    if unavailable:
+        raise ConfigError("Inbox inventory is incomplete; retry unavailable notes before notification.")
     return notes
 
 
 def notification_body(config: dict[str, str], root: Path) -> tuple[str, str] | None:
     pipeline = pipeline_store(root)
     with state_update_lock(root):
-        payload = pipeline.digest(pipeline.load(), pending_review_notes(root))
+        payload = pipeline.digest(pipeline.load(), pending_review_notes(root), inbox=inbox_notes(root))
     return (payload["subject"], payload["body"]) if payload else None
 
 
-def send_msmtp(recipient: str, subject: str, body: str, html_body: str = "") -> None:
+def send_msmtp(recipient: str, subject: str, body: str, html_body: str = "", sender: str = "") -> None:
     if not shutil.which("msmtp"):
         raise SystemExit("msmtp is not available; configure Gmail connector or install msmtp.")
     if not re.fullmatch(r"[^\s<>;,\r\n]+@[^\s<>;,\r\n]+\.[^\s<>;,\r\n]+", recipient):
         raise ConfigError("Expected one configured email recipient.")
+    if sender and not re.fullmatch(r"[^\s<>;,\r\n]+@[^\s<>;,\r\n]+\.[^\s<>;,\r\n]+", sender):
+        raise ConfigError("Expected one configured email sender.")
     message = EmailMessage(policy=SMTP)
+    if sender:
+        message["From"] = sender
     message["To"] = recipient
     message["Subject"] = subject
-    message.set_content(body)
+    message.set_content(body, cte="base64")
     if html_body:
-        message.add_alternative(html_body, subtype="html")
-    subprocess.run(["msmtp", "--", recipient], input=message.as_string(),
+        message.add_alternative(html_body, subtype="html", cte="base64")
+    command = ["msmtp", "--from", sender] if sender else ["msmtp"]
+    subprocess.run([*command, "--", recipient], input=message.as_string(),
                    text=True, check=True, timeout=60)
 
 
@@ -1481,7 +1575,7 @@ def command_notify(args: argparse.Namespace) -> int:
         state = pipeline.load()
         if state["outbox"] and (not args.check_digest or state["outbox"]["digest_id"] != args.check_digest):
             raise ConfigError("A pending notification needs provider reconciliation before another send.")
-        payload = pipeline.digest(state, pending_review_notes(root))
+        payload = pipeline.digest(state, pending_review_notes(root), inbox=inbox_notes(root))
     if payload is None:
         print("NO_ACTION_REQUIRED")
         return 0
@@ -1493,14 +1587,17 @@ def command_notify(args: argparse.Namespace) -> int:
             raise SystemExit("AGENT_LEARNING_EMAIL is not configured for sending.")
         if not shutil.which("msmtp"):
             raise ConfigError("msmtp is unavailable; no notification was reserved.")
-        pipeline.reserve(payload, lambda value: pipeline.digest(value, pending_review_notes(root)))
+        sender = config.get("AGENT_LEARNING_EMAIL_FROM", "").strip()
+        if sender and (is_placeholder_email(sender) or not re.fullmatch(r"[^\s<>;,\r\n]+@[^\s<>;,\r\n]+\.[^\s<>;,\r\n]+", sender)):
+            raise ConfigError("AGENT_LEARNING_EMAIL_FROM must be a valid configured sender.")
+        pipeline.reserve(payload, lambda value: pipeline.digest(value, pending_review_notes(root), inbox=inbox_notes(root)))
         # An exception preserves the outbox: provider acceptance may be uncertain.
-        send_msmtp(recipient, payload["subject"], payload["body"], payload["html"])
+        send_msmtp(recipient, payload["subject"], payload["body"], payload["html"], sender)
         pipeline.acknowledge(payload["digest_id"], "msmtp exited successfully")
         print(f"SENT {recipient}")
         return 0
     if args.prepare:
-        pipeline.reserve(payload, lambda value: pipeline.digest(value, pending_review_notes(root)))
+        pipeline.reserve(payload, lambda value: pipeline.digest(value, pending_review_notes(root), inbox=inbox_notes(root)))
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
@@ -1560,7 +1657,8 @@ def pipeline_inventory(root: Path) -> list[dict[str, str]]:
 
 
 def command_pipeline(args: argparse.Namespace) -> int:
-    root = learning_root(load_config(args.config))
+    config = load_config(args.config)
+    root = learning_root(config)
     ensure_store(root)
     pipeline = pipeline_store(root)
     operation = args.command
@@ -1570,7 +1668,10 @@ def command_pipeline(args: argparse.Namespace) -> int:
     elif operation == "pipeline-status":
         result = pipeline.status()
     elif operation == "pipeline-begin":
-        result = pipeline.begin(args.run_id, args.runner, pipeline_inventory(root))
+        initial_inbox, unavailable = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")))
+        result = pipeline.begin(args.run_id, args.runner, pipeline_inventory(root),
+                                [{"id": n["id"], "path": n["path"], "sha256": n["sha256"]}
+                                 for n in initial_inbox], unavailable)
     elif operation == "pipeline-issue":
         issue = read_json_input(args.from_json)
         for ref in issue.get("sources", []):
@@ -1585,10 +1686,21 @@ def command_pipeline(args: argparse.Namespace) -> int:
                 raise ConfigError("Explicit human decisions take precedence over pipeline classifications.")
         result = pipeline.update_issue(issue)
     elif operation == "pipeline-finish":
+        if args.status == "completed":
+            if (getattr(args, "require_integration", False)
+                    or config.get("AGENT_LEARNING_REQUIRE_INTEGRATION", "0") == "1"):
+                run = pipeline.active(pipeline.load(), args.run_id)
+                require_run_integrations(root, run)
+            for folder in ("inbox", "needs-review"):
+                _, unavailable = bounded_note_inventory(root, sorted((root / folder).glob("*.md")))
+                if unavailable:
+                    raise ConfigError("Current note inventory is incomplete; completion is not verified.")
         inventory = pipeline_inventory(root) if args.status == "completed" else None
         result = pipeline.finish(args.run_id, args.status, args.summary, args.report, args.target or [], inventory)
     elif operation == "pipeline-release-status":
         result = pipeline.weekly_release_status()
+        if config.get("AGENT_LEARNING_REQUIRE_INTEGRATION", "0") == "1":
+            require_run_integrations(root, result["consolidation"])
     elif operation == "notify-ack":
         pipeline.acknowledge(args.digest_id, args.receipt, not args.not_delivered)
         result = {"acknowledged": args.digest_id, "delivered": not args.not_delivered}
@@ -1959,10 +2071,129 @@ def add_routing_arguments(parser: argparse.ArgumentParser, *, include_enforce: b
         parser.add_argument("--enforce-routing", action="store_true")
 
 
+def integration_entries(root: Path, state: dict, note_ids: list[str]) -> list[dict]:
+    entries = []
+    for note_id in note_ids:
+        entry = state.get("processed", {}).get(note_id, {})
+        target = Path(entry.get("path", "")).expanduser().resolve()
+        if (entry.get("status") != "processed" or not target.is_file()
+                or not target.is_relative_to((root / "processed").resolve())):
+            raise ConfigError(f"Integration requires an archived note in the configured store: {note_id}")
+        entries.append(entry)
+    return entries
+
+
+def integration_problem(entry: dict, note_id: str, cache: dict | None = None) -> str:
+    if entry.get("integration_status") != "verified":
+        return "No verified integration receipt; processed is archival status only."
+    key = ""
+    try:
+        reference = entry.get("integration_receipt", {})
+        key = json.dumps(reference, sort_keys=True)
+        if cache is not None and key in cache:
+            receipt = cache[key]
+            if isinstance(receipt, str):
+                return receipt
+        else:
+            receipt = validate_receipt(reference)
+            if cache is not None:
+                cache[key] = receipt
+        if note_id not in receipt["manifest"]["note_ids"]:
+            return "Integration receipt does not cover this note."
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        if cache is not None and key:
+            cache[key] = str(exc)
+        return str(exc)
+    return ""
+
+
+def require_run_integrations(root: Path, run: dict) -> None:
+    start = datetime.fromisoformat(run["started_at"]).replace(microsecond=0)
+    end = datetime.fromisoformat(run["finished_at"]) if run.get("finished_at") else None
+    failures, cache = [], {}
+    for note_id, entry in load_state(root).get("processed", {}).items():
+        if entry.get("status") != "processed":
+            continue
+        when = datetime.fromisoformat(entry.get("processed_at", "1970-01-01T00:00:00+00:00"))
+        if when >= start and (end is None or when <= end):
+            problem = integration_problem(entry, note_id, cache)
+            if problem:
+                failures.append(f"{note_id}: {problem}")
+    if failures:
+        raise ConfigError("Integration is incomplete: " + "; ".join(failures))
+
+
+def command_integration(args: argparse.Namespace) -> int:
+    root = learning_root(load_config(args.config))
+    if args.command == "coherence-proposal":
+        manifest = json.loads(Path(args.manifest).read_text())
+        result = verify_coherence(manifest, verify_distribution(manifest), require_reviews=False)
+        print(json.dumps({"status": "awaiting-review", **result}, indent=2))
+        return 0
+    if args.command == "integration-check":
+        manifest = json.loads(Path(args.manifest).read_text())
+        result = verify_integration(manifest)
+        print(json.dumps({"status": "verified", "verified": result}, indent=2))
+        return 0
+    if args.command == "integration-record":
+        manifest = json.loads(Path(args.manifest).read_text())
+        verified = verify_integration(manifest)
+        with state_update_lock(root):
+            state = load_state(root)
+            entries = integration_entries(root, state, manifest["note_ids"])
+            covered_files = set(verified["files"]) | set(verified["generated"])
+            for skill_root, payload in verified["skills"].items():
+                covered_files.update(str(Path(skill_root) / name) for name in payload)
+            for entry in entries:
+                for raw in entry.get("prevention_targets", []) + entry.get("detection_targets", []):
+                    target = concrete_routing_target_path(raw)
+                    if target is not None and str(target) not in covered_files:
+                        raise ConfigError(f"Integration omitted a recorded concrete target: {raw}")
+            if any(e.get("template_upstream_status") in {"draft-created", "deferred"} for e in entries):
+                if manifest.get("template_status") != "promoted":
+                    raise ConfigError("Resolve the template handoff before recording complete integration.")
+            if verify_integration(manifest) != verified:
+                raise ConfigError("Integration targets changed while preparing the receipt.")
+            receipt = {"manifest": manifest, "verified": verified, "verified_at": now_iso()}
+            receipt_path = store_directory(root, root / "reports" / "integrations") / f"{uuid.uuid4().hex}.json"
+            atomic_write_text(receipt_path, json.dumps(receipt, indent=2) + "\n")
+            reference = {"path": str(receipt_path), "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest()}
+            for entry in entries:
+                entry.update(integration_status="verified", integration_receipt=reference)
+                if (manifest.get("template_status") == "promoted"
+                        and entry.get("template_upstream_status") in {"draft-created", "deferred", "promoted"}):
+                    entry["template_upstream_status"] = "promoted"
+            save_state(root, state)
+        print(json.dumps({"status": "verified", "receipt": reference, "note_ids": manifest["note_ids"]}, indent=2))
+        return 0
+    state = load_state(root)
+    requested = set(args.note_id or [])
+    rows, cache = [], {}
+    for note_id, entry in state.get("processed", {}).items():
+        if entry.get("status") != "processed" or (requested and note_id not in requested):
+            continue
+        problem = integration_problem(entry, note_id, cache)
+        rows.append({"note_id": note_id, "status": "pending" if problem else "verified", "reason": problem})
+    found = {row["note_id"] for row in rows}
+    rows.extend({"note_id": key, "status": "pending", "reason": "Unknown or unprocessed note."} for key in requested - found)
+    print(json.dumps({"notes": rows, "verified": sum(r["status"] == "verified" for r in rows),
+                      "pending": sum(r["status"] != "verified" for r in rows)}, indent=2))
+    return 1 if args.require_verified and any(r["status"] != "verified" for r in rows) else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("coherence-proposal", "integration-check", "integration-record", "integration-audit"):
+        integration = sub.add_parser(name)
+        if name == "integration-audit":
+            integration.add_argument("--note-id", action="append")
+            integration.add_argument("--require-verified", action="store_true")
+        else:
+            integration.add_argument("--manifest", required=True)
+        integration.set_defaults(func=command_integration)
 
     init_store = sub.add_parser("init-store")
     init_store.set_defaults(func=command_init_store)
@@ -2063,6 +2294,7 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("--summary", required=True)
     finish.add_argument("--report", default="")
     finish.add_argument("--target", action="append")
+    finish.add_argument("--require-integration", action="store_true")
     finish.set_defaults(func=command_pipeline)
     ack = sub.add_parser("notify-ack")
     ack.add_argument("--digest-id", required=True)

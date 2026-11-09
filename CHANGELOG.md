@@ -6,6 +6,37 @@ The project follows semantic versioning.
 
 ## Unreleased
 
+## [1.3.0] - 2026-11-09
+
+### Added
+
+- Verified learning integration with owning-source coverage, complete installed
+  skill parity and refreshed template consumers. Proposal-bound coherence review
+  covers policy, retained behavior, routing and reading cost with proportionate
+  independent review; current receipts gate consolidation completion.
+- Inbox cohorts and bounded source discovery with explicit unavailable-source
+  reporting. Completion requires recorded outcomes for every initial inbox note.
+- Digest alerts for aged or undated inbox notes, an optional verified email sender,
+  and a terminal fallback for opening Codex chat links.
+
+### Changed
+
+- Compact the consolidation entrypoint around shared review, routing and
+  integration contracts while preserving source identities and operational gates.
+- Require review and consumer verification for pending template handoffs,
+  including already-applied outcomes and obsolete routing targets.
+- Treat accumulated automation edits as release candidates; reconcile their
+  provenance, concurrent worktrees and active consumers before source cleanup.
+- Use the configured local mail sender for the morning review digest.
+
+### Fixed
+
+- Serialize learning-state updates with process-owned locks and fail completion
+  when initial inbox discovery or integration evidence is incomplete.
+- Reject inventory symlinks outside the configured learning store before reading
+  content; keep unavailable sources explicit and notification fail-closed.
+- Keep sample learning-store paths portable.
+
 ## [1.2.0] - 2026-10-27
 
 ### Added

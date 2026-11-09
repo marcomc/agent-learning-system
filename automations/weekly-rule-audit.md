@@ -13,3 +13,9 @@ retained coverage and saved evidence.
 Consolidation owns authorized instruction changes and scoped post-verification.
 The morning digest owns ordinary email. Retire the standalone weekly schedule
 to avoid duplicate discovery, competing ownership and stale notifications.
+
+Follow the consolidation skill's `references/coherence.md` before promotion:
+review the complete affected contract with proportionate independent lenses and
+retain current coherence proof. Weekly discovery must assess cumulative size,
+repetition and rule interactions across promotions; lexical candidates and
+budget warnings require semantic classification, not another appended rule.

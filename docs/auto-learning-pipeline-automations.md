@@ -19,8 +19,8 @@ The full pipeline needs both repositories:
 
 | Repository | Responsibility |
 | --- | --- |
-| `${HOME}/Development/agent-learning-system` | Record notes, consolidate reviews, route prevention targets, create template drafts, audit installed rules |
-| `${HOME}/Development/agents-file-templates-and-skills` | Review approved drafts, update curated atoms, report projects that need refreshed generated instructions |
+| `agent-learning-system` | Record notes, consolidate reviews, route prevention targets, create template drafts, audit installed rules |
+| `agents-file-templates-and-skills` | Review approved drafts, update curated atoms, report projects that need refreshed generated instructions |
 
 This two-repository runbook is the core learning pipeline. The general skills
 repository and skills installer participate through skill hooks, source
@@ -69,17 +69,22 @@ in the template project. See [chat setup](../automations/README.md#set-up-the-pr
 
 ## Install Checklist
 
-1. Verify both repositories exist:
+1. Set the checkout and project-scan paths for your environment, then verify
+   both repositories exist. Reuse these variables for the remaining steps:
 
    ```bash
-   test -d "${HOME}/Development/agent-learning-system"
-   test -d "${HOME}/Development/agents-file-templates-and-skills"
+   export LEARNING_REPO="/path/to/agent-learning-system"
+   export TEMPLATE_REPO="/path/to/agents-file-templates-and-skills"
+   export PROJECTS_ROOT="/path/to/projects"
+   test -d "${LEARNING_REPO}"
+   test -d "${TEMPLATE_REPO}"
+   test -d "${PROJECTS_ROOT}"
    ```
 
 2. Install or refresh the learning system:
 
    ```bash
-   cd "${HOME}/Development/agent-learning-system"
+   cd "${LEARNING_REPO}"
 
    set -a
    . "${HOME}/.config/agent-learning-system/config.env"
@@ -98,7 +103,7 @@ in the template project. See [chat setup](../automations/README.md#set-up-the-pr
 3. Install or refresh the template skills:
 
    ```bash
-   cd "${HOME}/Development/agents-file-templates-and-skills"
+   cd "${TEMPLATE_REPO}"
    make install AGENTS="openai"
    ```
 
@@ -155,7 +160,7 @@ in the template project. See [chat setup](../automations/README.md#set-up-the-pr
 After setup, verify the learning side:
 
 ```bash
-cd "${HOME}/Development/agent-learning-system"
+cd "${LEARNING_REPO}"
 python3 scripts/agent_learning.py init-store
 python3 scripts/agent_learning.py prepare-run
 markdownlint --config "${HOME}/.markdownlint.json" \
@@ -168,13 +173,13 @@ python3 -m unittest discover -s tests
 Verify the template side:
 
 ```bash
-cd "${HOME}/Development/agents-file-templates-and-skills"
+cd "${TEMPLATE_REPO}"
 python3 skills/update-agents-file-templates/scripts/update_agents_templates.py \
   --template-repo . \
   --learning-upstream-summary
 python3 skills/update-agents-file-templates/scripts/update_agents_templates.py \
   --template-repo . \
-  --scan-root "${HOME}/Development" \
+  --scan-root "${PROJECTS_ROOT}" \
   --out-of-sync-report
 make validate
 ```

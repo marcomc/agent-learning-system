@@ -6,6 +6,14 @@ The project follows semantic versioning.
 
 ## Unreleased
 
+## [1.3.1] - 2026-11-09
+
+### Fixed
+
+- Make the two-repository automation runbook independent of local checkout and
+  project-scan directory layouts.
+- Exclude local editor workspace files from version control.
+
 ## [1.3.0] - 2026-11-09
 
 ### Added

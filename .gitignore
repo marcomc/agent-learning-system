@@ -5,3 +5,6 @@ __pycache__/
 .coverage
 .work/
 config.local.env
+
+# Local editor workspace configuration
+*.code-workspace

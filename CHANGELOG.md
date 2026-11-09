@@ -8,15 +8,17 @@ The project follows semantic versioning.
 
 ### Added
 
-- Compact the consolidation entrypoint around existing review, routing and
-  integration contracts while preserving source identities and operational gates.
+## [1.3.0] - 2026-11-09
 
-- Mandatory coherence evidence for learning integration: whole-contract policy,
+### Added
+
+- Compact the consolidation entrypoint around existing review, routing and (LEARNING-01)
+  integration contracts while preserving source identities and operational gates.
+- Mandatory coherence evidence for learning integration: whole-contract policy, (LEARNING-02)
   coverage, routing and cost review, proportionate independent councils, measured
   size deltas and proposal-bound reports; retain old distribution-only receipts
   as historical evidence.
-
-- Integration manifests and revalidated receipts for owning sources, complete
+- Integration manifests and revalidated receipts for owning sources, complete (LEARNING-03)
   skill projections and generated template consumers. Separate archival from
   verified integration and gate configured consolidation completion on proof.
 - Explicit review and consumer-refresh requirements for pending template

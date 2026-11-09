@@ -117,6 +117,13 @@ to the receipt: a hash proves identity, not the truth of the agent's judgment.
 Add separate decisions with unresolved questions to that report; never encode
 an unresolved choice as a technical conclusion just to reduce the queue.
 
+If a note already records an implementation file as a routing target, retain
+that target and record its current path and SHA-256 in the decision's
+`implementation_evidence`. The path must remain inside the note's project and
+must already be present in its routing metadata. The receipt still requires a
+verified instruction target; implementation evidence grants no authority to edit
+product code. Reassess coverage if any snapshot changes.
+
 ```bash
 python3 scripts/agent_learning.py finalize-note \
   --file "/learning-store/needs-review/a.md" \

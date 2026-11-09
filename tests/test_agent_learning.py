@@ -946,6 +946,32 @@ status: "needs-review"
         self.assertEqual(message["Subject"], "Review needed")
         self.assertEqual(message.get_content().strip(), "One note")
 
+    def test_digest_mime_preserves_codex_link_in_both_alternatives(self) -> None:
+        module = load_agent_learning_module()
+        link = "codex://threads/11111111-1111-1111-1111-111111111111"
+        with (patch.object(module.shutil, "which", return_value="/usr/local/bin/msmtp"),
+              patch.object(module.subprocess, "run") as run):
+            module.send_msmtp("reviewer@example.test", "Review", "Open " + link,
+                              '<a href="' + link + '">Open</a>')
+        message = Parser(policy=policy.default).parsestr(run.call_args.kwargs["input"])
+        parts = list(message.iter_parts())
+        self.assertEqual([part["Content-Transfer-Encoding"] for part in parts], ["base64", "base64"])
+        self.assertTrue(all(link in part.get_content() for part in parts))
+
+    def test_digest_uses_explicit_sender_for_header_and_envelope(self) -> None:
+        module = load_agent_learning_module()
+        with (patch.object(module.shutil, "which", return_value="/usr/local/bin/msmtp"),
+              patch.object(module.subprocess, "run") as run):
+            module.send_msmtp("recipient@example.test", "Review", "Body", "",
+                              "sender+learning@example.test")
+            self.assertEqual(run.call_args.args[0], ["msmtp", "--from", "sender+learning@example.test",
+                                                     "--", "recipient@example.test"])
+            message = Parser(policy=policy.default).parsestr(run.call_args.kwargs["input"])
+            self.assertEqual(message["From"], "sender+learning@example.test")
+            with self.assertRaises(module.ConfigError):
+                module.send_msmtp("recipient@example.test", "Review", "Body", "", "bad\nBcc: x@example.test")
+            self.assertEqual(run.call_count, 1)
+
     def test_send_email_uses_explicit_body_file_and_configured_recipient(self) -> None:
         module = load_agent_learning_module()
         with tempfile.TemporaryDirectory() as raw:

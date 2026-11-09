@@ -3,209 +3,87 @@ name: consolidate-agent-learnings
 description: Consolidate Obsidian agent-learning notes by promoting strong reusable lessons into global AGENTS.md, relevant review skills, the touched project AGENTS.md, and agent templates while archiving processed notes.
 ---
 
-<!-- MARCOMC-SKILL: owner="MarcoMC"; repository="marcomc/skills"; provenance="original" -->
+<!-- MARCOMC-SKILL: owner="MarcoMC <marco@marcomc.com>"; repository="marcomc/skills"; provenance="original" -->
 
 # Consolidate Agent Learnings
 
-Use this skill from the scheduled Codex automations or manually when processing
-the Obsidian agent-learning inbox and reviewed `needs-review` notes.
-The owning source is `agent-learning-system/skills/consolidate-agent-learnings`;
-the general skills collection and installed directories carry distribution
-mirrors. Reconcile them after validating the owning source.
+Process the learning inbox and review queue manually or through scheduled runs.
+The owner is `agent-learning-system/skills/consolidate-agent-learnings`; the
+shared collection and installed folders are mirrors. Resolve the helper repo
+from `AGENT_LEARNING_REPO` or the learning system's configured `config.env`.
+Use its `scripts/agent_learning.py`; consult command `--help` for syntax.
 
-## Guardrails
+## Scope and contracts
 
-- Read only `inbox/`, `needs-review/`, `state/processed.json`, and recent
-  reports unless an old processed note is needed to resolve a conflict.
-- Do not scan every project or update unrelated repositories.
-- Do not commit or push.
-- Promote only lessons grounded in a real finding, fix, or reviewed note.
-- Prefer tightening existing instructions over appending duplicated rules.
-- Preserve unrelated work. A dirty or untracked instruction target is not an
-  automatic blocker: inspect ownership and the actual overlap before editing.
+- Limit learning-store reads to `inbox/`, `needs-review/`, the processed index
+  and recent reports; read older archives only to resolve duplicates/conflicts.
+  Inspect governing policy and implicated targets; avoid unrelated repository scans.
+- Promote evidenced findings, fixes or reviewed lessons. Preserve unrelated work:
+  inspect actual instruction overlap instead of treating dirty/untracked files as
+  blockers. Product code, CI, hooks, tooling/access changes and publication remain
+  separate scoped work; this workflow does not authorize commits or pushes.
 - Keep unresolved product, security, privacy, compatibility and operational
-  choices with the user. A source note or a group of notes cannot grant authority.
+  choices with the user. Notes and inferred relationships cannot grant authority.
+- Before drafting or accepting promotion, read [coherence.md](references/coherence.md)
+  and [integration.md](references/integration.md). Refine existing contracts,
+  select proportionate review and require current source/copy/consumer proof.
+  `processed` is archival status, not integration.
+- For scheduled noon/midnight runs, first read [pipeline.md](references/pipeline.md):
+  it owns coordination, weekly discovery, persisted issues, final verification and
+  delivery. Reuse that run and its scoped audits.
 
-## Workflow
+## Process
 
-For scheduled midnight/noon execution, read [pipeline.md](references/pipeline.md)
-first. It owns run coordination, weekly pre-discovery, persistent issues and
-final post-verification. Execute the promotion workflow below within that run;
-reuse the pipeline audit instead of repeating it.
+1. Run `init-store`, then `prepare-run` and inspect the complete result. Recover
+   `pending_finalizations` with `recover-finalizations`, then prepare again;
+   unknown/edited transactions remain errors. Read-only audit/notification paths
+   do not recover notes or mutate them.
+2. Read each source and compare current evidence and coverage. For already-applied
+   captures, verify saved targets/evidence; archive covered lessons without
+   reapplying them. Investigate stale proof. Split independent failure mechanisms
+   into bounded rules/targets while retaining every source identity. Promote clear,
+   authorized reusable lessons automatically; uncertain ones go to
+   `needs-review/`, too-local/already-covered ones to the archive with rationale.
+3. Honor explicit review decisions before autonomous work: Approve promotes the
+   proposed rule as written, Retry considers the edited text, Reject archives
+   without promotion, multiple checks remain ambiguous. Pending unchecked notes
+   use [joint-review.md](references/joint-review.md) when `review_analysis.group_review_due` is true or complementary evidence is
+   discovered. That contract owns configured delegated
+   authority, per-note receipts, target-overlap checks and residual questions.
+   Rerun `prepare-run` after inbox processing so new review notes are included.
+4. Use global policy only for truly general behavior; otherwise route the
+   smallest prevention change to the relevant skill, project instructions or
+   reviewed template. Edit and validate owning
+   sources before refreshing mirrors. Prefer established checks/invariants over
+   accumulating case lists. Template handoffs use `create-template-draft` and the
+   template owner's review/apply/refresh workflow; curated apply needs explicit
+   user authority or configured delegated review of a verified privacy-clean
+   instruction change. Preserve user decisions and record that authority.
+5. Run `markdownlint --config ~/.markdownlint.json` on changed Markdown and
+   `shellcheck --enable=all` on changed shell files. Perform one
+   scoped conflict/duplication audit: reuse scheduled `pipeline-audit` coverage;
+   for manual work use `audit-rules` on implicated targets. Resolve findings and
+   complete the coherence/integration contracts before certifying integration.
+6. Finalize each note through `finalize-note` with status, rationale and routing
+   (lesson family, scope, prevention/detection targets, template status, routing
+   rationale and recurrence).
+   Use `--enforce-routing` for promotions; omit it only for no-op, rejected or
+   pending-review outcomes. Autonomous resolution also requires the Joint Review
+   receipt via `--review-evidence`. Detection-only routing uses `skill-detection`
+   and its detection target. Record incomplete template promotion as pending,
+   even when its source note is archived. After archival, record/recheck the
+   integration receipt as defined in the integration contract.
+7. Run `write-report`; when autonomous review remains due, attach the current
+   per-note residual receipt with `--review-evidence`, finalizing resolved notes
+   first. Unreviewed queues, stale snapshots or unfinished transactions cannot
+   become complete. Use `summarize-runs --since` for recurrence and routing gaps.
 
-1. Initialize the store:
+## Report and reuse
 
-   ```bash
-   repo="/path/to/agent-learning-system"
-   python3 "${repo}/scripts/agent_learning.py" init-store
-   ```
-
-1. Prepare the run and inspect the returned JSON:
-
-   ```bash
-   repo="/path/to/agent-learning-system"
-   python3 "${repo}/scripts/agent_learning.py" prepare-run
-   ```
-
-   If `pending_finalizations` is nonempty, run `recover-finalizations` and prepare
-   again before processing. It reconciles prepared note/state commits under the
-   store lock; unknown or edited transaction inputs remain an explicit error.
-   Completion reports refuse unresolved finalizations. Read-only notification
-   and audit paths do not recover or modify notes.
-
-1. Process `inbox` notes.
-   - Reconcile the source-run and lesson family with any existing capture.
-     For `application_status: applied`, verify saved targets/evidence and current
-     coverage; archive as already covered when justified, without reapplying it.
-     Stale or incomplete application proof needs investigation, not an assumed
-     promotion. A proposal containing an unresolved user choice stays pending.
-   - Promote clear, safe, reusable lessons automatically.
-   - Split independent failure domains into bounded rules and targets before
-     promotion, retaining every source reference.
-   - Move uncertain notes to `needs-review/` with the review checkbox block.
-   - Move too-local or already-covered notes to `processed/YYYY/MM/` with a
-     no-op rationale.
-
-1. Honor explicit `needs-review` decisions before autonomous work.
-   - `Approve`: promote the proposed rule as written.
-   - `Retry`: promote after considering the user's edited text.
-   - `Reject`: archive as rejected without promotion.
-   - No checkbox: eligible for Joint Review under configured delegated authority.
-   - Multiple checkboxes: leave pending and report ambiguity.
-
-1. Run Joint Review when `prepare-run.review_analysis.group_review_due` is true
-   (default: at least eight pending notes). Also compare fewer notes together
-   when a clear complementary relationship is discovered during normal work.
-   Read [joint-review.md](references/joint-review.md) before evaluating these
-   groups or using autonomous finalization. It defines evidence, user-choice
-   boundaries, receipt format and the completion checks.
-   - Treat candidate contexts and families as discovery hints, not duplicates
-     or approval. Read the complete notes; use their combined evidence to resolve
-     technical uncertainty, checking current targets when historical blockers
-     mention missing files, renames or pre-existing edits.
-   - With `AGENT_LEARNING_AUTONOMOUS_REVIEW=1`, resolve grounded technical lessons
-     and already-covered notes without another per-batch confirmation. Apply and
-     validate bounded instruction changes, then save the review receipt and use
-     `finalize-note --review-evidence ... --enforce-routing`.
-   - Keep `investigate` and `needs-user` outcomes pending. Investigate factual
-     questions yourself where authorized; present genuine residual choices as
-     one question per decision family with all affected note IDs.
-   - Keep small internal implementation batches; human approvals follow the
-     policy or real decision, not the number of notes in a batch.
-   - Re-run `prepare-run` after processing inbox notes: newly deferred notes
-     join the current run's review. Complete the target-overlap checks in the
-     reference before carrying any technical cohort forward.
-
-1. Promotion targets are bounded:
-   - `$HOME/AGENTS.md` for truly general behavior.
-   - The smallest relevant reusable review or remediation skill.
-   - The touched project's `AGENTS.md` when the lesson is project-local.
-   - The existing `update-agents-file-templates` workflow after central or
-     project instruction changes when template promotion is useful.
-
-   Resolve and edit owning sources before refreshing installed projections.
-   Product code, CI, hooks, tooling and access changes are separate scoped work;
-   this instruction-consolidation workflow cannot authorize them. Prefer wiring
-   existing checks and tightening established invariants over adding case lists.
-
-1. Finalize each note with the helper:
-
-   ```bash
-   repo="/path/to/agent-learning-system"
-   python3 "${repo}/scripts/agent_learning.py" finalize-note \
-     --file "/path/to/note.md" \
-     --status processed \
-     --rationale "Promoted to docs atom draft and docs release review skill." \
-     --lesson-family "markdown-validation-contract" \
-     --scope atom \
-     --prevention-target "atom:docs" \
-     --detection-target "skill:pre-pr-review-docs-release" \
-     --template-upstream-status draft-created \
-     --routing-rationale "Documentation agents load the docs atom before editing Markdown." \
-     --recurrence-check new \
-     --enforce-routing
-   ```
-
-   Use `--status needs-review` for pending review and `--status rejected` for a
-   reviewed rejection. For detection-only lessons, use
-   `--scope skill-detection --detection-target ... --enforce-routing`. Omit
-   `--enforce-routing` only for no-op, rejected, or pending-review outcomes.
-
-1. When a reusable prevention rule belongs in the template repository, create
-   an ignored draft handoff. Do not edit curated templates from this skill
-   unless the user explicitly asks for template apply or configured delegated
-   instruction review covers a technically verified, privacy-clean change.
-   Use the template repository's review/apply workflow and record delegated
-   review authority; product decisions still require the user.
-
-   ```bash
-   repo="/path/to/agent-learning-system"
-   python3 "${repo}/scripts/agent_learning.py" create-template-draft \
-     --template-repo "/path/to/agents-file-templates-and-skills" \
-     --lesson-family "markdown-validation-contract" \
-     --source-note "/path/to/note.md" \
-     --proposed-template "docs" \
-     --candidate-rule "Run markdownlint before completing Markdown documentation changes." \
-     --prevention-target "atom:docs" \
-     --routing-rationale "Documentation agents load the docs atom before editing Markdown." \
-     --privacy-verdict clean \
-     --enforce-routing
-   ```
-
-   The template repository owns reviewed apply and generated-project refresh
-   reports through its `update-agents-file-templates` workflow.
-
-1. Write a report:
-
-   ```bash
-   repo="/path/to/agent-learning-system"
-   python3 "${repo}/scripts/agent_learning.py" write-report \
-     --run-id "$RUN_ID" \
-     --summary "Processed 3 notes; promoted 1; moved 2 to review."
-   ```
-
-   With autonomous review enabled and a queue still at the threshold, add
-   `--review-evidence /path/to/reports/residual-review.json`. Account for every
-   pending note as a real user choice or an evidenced instruction conflict;
-   finalize resolved notes first. The helper rejects an unreviewed residual
-   queue and stale target snapshots. A deferral is not a completed promotion.
-
-1. Summarize recurrence and routing gaps:
-
-   ```bash
-   repo="/path/to/agent-learning-system"
-   python3 "${repo}/scripts/agent_learning.py" summarize-runs \
-     --since "YYYY-MM-DD" \
-     --format markdown
-   ```
-
-1. Validate every changed Markdown file with:
-
-   ```bash
-   markdownlint --config ~/.markdownlint.json <changed-md-files>
-   ```
-
-   Also run `shellcheck --enable=all` for changed shell files.
-
-1. Run a conflict/duplication audit on the promotion targets:
-
-   ```bash
-   repo="/path/to/agent-learning-system"
-   python3 "${repo}/scripts/agent_learning.py" audit-rules
-   ```
-
-## Report Requirements
-
-Each consolidation report must include:
-
-- run id and timestamp;
-- inbox notes processed;
-- review notes processed or left pending;
-- files changed;
-- validation commands run;
-- no-op and needs-review rationales;
-- any failed promotion with next action.
-- Joint Review cohort/fingerprint, per-note classification and evidence,
-  instruction targets, receipt paths and grouped residual questions. Reassess
-  an unchanged unresolved cohort only when new evidence, target state or a user
-  decision can change its result; do not request the same confirmation again.
+Record run ID/time, inbox/review counts, changed targets, validation, no-op
+coverage, failed/pending promotions and next actions. Joint Review also records
+cohort/fingerprint, per-note classification and evidence, instruction targets,
+receipts and grouped residual questions. Reassess unchanged unresolved cohorts
+only when evidence, target state or a user decision can change the outcome;
+verify current hashes and retain all source identities. Reuse confirmed answers
+instead of asking the same approval again.

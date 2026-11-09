@@ -8,8 +8,8 @@ through provider evidence before another send.
 Send only when the helper returns a digest and the recipient is configured.
 Each decision includes its description, actual question, described options and
 clickable verified chat link. Preserve the helper's readable HTML and plain-text
-alternative. Prefer a Gmail connector capable of sending both; otherwise use
-the single `notify --send-msmtp` path. Follow the reservation, revalidation and
+alternative. Use `notify --send-msmtp` so the configured sender is used for
+both the message and SMTP envelope. Follow the reservation, revalidation and
 receipt commands in the delivery contract.
 
 Keep technical investigation with the agent. Do not alter notes or instructions,

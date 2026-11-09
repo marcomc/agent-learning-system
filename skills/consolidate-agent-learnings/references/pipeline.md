@@ -22,8 +22,26 @@ explicit maintenance task.
 
 ## Consolidate and classify
 
-Run the ordinary skill workflow for notes and explicit user decisions. Read
-open audit issues and their implicated current instruction contexts. Classify
+Capture the initial inbox inventory and prioritize the oldest notes. Use
+`prepare-run.inbox_analysis.candidate_cohorts`, `candidate_contexts` and shared skill,
+source-run and review contexts to investigate related sources together. These
+are hints, not proof of equivalence or authority: read each note and retain its
+own decision and evidence. Reuse shared target and source checks within a cohort.
+Consider inbox and review notes together when they address the same mechanism;
+the eight-note threshold does not limit grouping inbox notes.
+
+`prepare-run` bounds individual note reads. If `inventory_complete` is false,
+retain `unavailable_sources` as unknown, retry them, and process independent
+readable cohorts. Never report the partial inventory as empty or complete. A run
+that began with unreadable inbox sources cannot finish `completed`; retry those
+sources in a new run after access recovers.
+
+Continue in bounded batches until each initial note is finalized or has a
+specific unresolved blocker and next action. A technical
+blocker on one note does not defer independent notes. Recheck the inventory and
+include counts, the oldest remaining note and per-note blockers in the report.
+Then process explicit user decisions and open audit issues and their implicated
+current instruction contexts. Classify
 each candidate as `investigate`, `needs-user`, `resolved` or `justified`:
 
 - apply bounded verified instruction improvements under configured authority;
@@ -65,10 +83,18 @@ removing redundant clauses within an existing file is supported.
 may omit unchanged fields. `resolved` and `justified` need a `resolution` and
 `evidence` containing report paths in this store. Close note issues while their
 sources remain available, then finalize through the normal evidence/routing
-gate; a failed finalization leaves a partial run. Use the user's language for
-decision titles, descriptions, questions and options.
+gate; a failed finalization leaves a partial run. Use the configured digest
+language for decision titles, descriptions, questions, options and run
+summaries. Preserve the meaning of existing decisions when revalidating them;
+do not invent choices or translate quoted source evidence.
 
 ## Verify and finish
+
+Follow [integration.md](integration.md) for source ownership, full installed-tree
+parity, template review, generated-consumer refresh and integration receipts.
+Audit previously verified receipts for drift; process pending handoffs rather
+than repeatedly skipping their review. Keep historical missing-proof debt
+separate from new failed or incomplete promotions.
 
 After instruction changes, run one `pipeline-audit --run-id ID --target FILE`
 with repeated `--target` arguments for every changed instruction file. It
@@ -78,12 +104,14 @@ prove input identity, not correctness. Reuse unchanged proof rather than running
 a second full independent audit or processing archived history.
 
 Validate files, finalize eligible notes and save the consolidation report. Run
-`pipeline-finish --run-id ID --status completed --summary TEXT --report REPORT`,
+`pipeline-finish --run-id ID --status completed --summary TEXT --report REPORT --require-integration`,
 with every changed instruction file repeated as `--target`. Completion requires
-this week's discovery, classified audit candidates, a report, no unfinished
+recorded finalization of the initial inbox, this week's discovery, classified audit candidates, a report, no unfinished
 note transaction and current post-audit coverage for every declared target.
-Runs with no changed instructions need no post scan. Use `partial` or `failed`
-with a concrete reason when required evidence is unavailable.
+Runs with no changed instructions need no post scan. Batch boundaries and
+unrelated unresolved findings do not justify ending the turn: keep processing
+actionable sources. Use `partial` or `failed` only for an actual interruption
+or concrete blocker; report unassessed notes honestly and do not call them blocked.
 
 ## Delivery
 
@@ -98,7 +126,9 @@ The digest emits HTML and plain text, described questions/options and a local
 The desktop app must handle local chat links. IDs belong in local state, not
 published prompts.
 
-For Gmail, run `notify --prepare`, retain its digest ID, then immediately run
+When `AGENT_LEARNING_EMAIL_FROM` is set, use `notify --send-msmtp`; the address
+must already be verified as a sender by the mail provider. It is independent of
+the recipient. Otherwise, for Gmail, run `notify --prepare`, retain its digest ID, then immediately run
 `notify --check-digest ID`. Send its exact subject, HTML and plain text using a
 connector supporting both. After provider confirmation run `notify-ack
 --digest-id ID --receipt PROVIDER_ID`. With no suitable connector, use
@@ -110,3 +140,9 @@ acknowledge delivery, or clear with `notify-ack --not-delivered` and verified
 non-delivery evidence. Never automatically replay an uncertain submission.
 Unchanged items are suppressed for seven days; changed questions/failures can
 be sent sooner. Revalidate before submission. `NO_ACTION_REQUIRED` means no mail.
+
+Follow the consolidation skill's `references/coherence.md` before promotion:
+review the complete affected contract with proportionate independent lenses and
+retain current coherence proof. Weekly discovery must assess cumulative size,
+repetition and rule interactions across promotions; lexical candidates and
+budget warnings require semantic classification, not another appended rule.

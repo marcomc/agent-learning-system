@@ -6,6 +6,22 @@ The project follows semantic versioning.
 
 ## Unreleased
 
+### Added
+
+- Compact the consolidation entrypoint around existing review, routing and
+  integration contracts while preserving source identities and operational gates.
+
+- Mandatory coherence evidence for learning integration: whole-contract policy,
+  coverage, routing and cost review, proportionate independent councils, measured
+  size deltas and proposal-bound reports; retain old distribution-only receipts
+  as historical evidence.
+
+- Integration manifests and revalidated receipts for owning sources, complete
+  skill projections and generated template consumers. Separate archival from
+  verified integration and gate configured consolidation completion on proof.
+- Explicit review and consumer-refresh requirements for pending template
+  handoffs, including already-applied outcomes and obsolete routing targets.
+
 ## [1.2.0] - 2026-10-27
 
 ### Added

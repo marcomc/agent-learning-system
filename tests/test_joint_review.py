@@ -143,6 +143,42 @@ class JointReviewTests(unittest.TestCase):
         self.assertEqual(len(analysis["candidate_contexts"]), 1)
         self.assertEqual(set(analysis["candidate_contexts"][0]["note_ids"]), {first.stem, second.stem})
 
+    def test_existing_implementation_target_needs_current_receipt_evidence(self) -> None:
+        first, second = self.note("a"), self.note("b")
+        implementation = self.target.parent / "helper.py"
+        implementation.write_text("# existing prevention implementation\n")
+        fm, body = module.read_note(first)
+        fm["prevention_targets"] = json.dumps([str(implementation)])
+        module.write_note(first, fm, body)
+        receipt, data = self.receipt([first, second])
+        self.assert_refused(first, receipt, "Concrete routing targets")
+        data["decisions"][0]["implementation_evidence"] = [{
+            "path": str(implementation), "sha256": hashlib.sha256(implementation.read_bytes()).hexdigest()
+        }]
+        receipt.write_text(json.dumps(data))
+        implementation.write_text("# changed after assessment\n")
+        self.assert_refused(first, receipt, "implementation evidence")
+        implementation.write_text("# existing prevention implementation\n")
+        self.finalize(first, receipt)
+        self.assertEqual(module.load_state(self.root)["processed"]["a"]["status"], "processed")
+
+    def test_implementation_evidence_cannot_authorize_new_or_outside_targets(self) -> None:
+        first, second = self.note("a"), self.note("b")
+        outside = self.directory / "outside.py"
+        outside.write_text("# unrelated\n")
+        receipt, data = self.receipt([first, second])
+        data["decisions"][0]["implementation_evidence"] = [{
+            "path": str(outside), "sha256": hashlib.sha256(outside.read_bytes()).hexdigest()
+        }]
+        receipt.write_text(json.dumps(data))
+        self.assert_refused(first, receipt, "implementation evidence")
+        result = self.run_helper(
+            "finalize-note", "--file", str(outside), "--status", "processed",
+            "--rationale", "must reject external source", check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(outside.read_text(), "# unrelated\n")
+
     def test_due_queue_cannot_be_reported_complete_without_review(self) -> None:
         self.set_policy(threshold="2")
         self.note("a")

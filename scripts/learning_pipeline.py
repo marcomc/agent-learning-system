@@ -114,7 +114,9 @@ class Pipeline:
             state["threads"] = {"ordinary": ordinary, "release": release, "language": language}
             self.save(state)
 
-    def begin(self, run_id: str, runner: str, targets: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    def begin(self, run_id: str, runner: str, targets: list[dict[str, str]] | None = None,
+              initial_inbox: list[dict[str, str]] | None = None,
+              unavailable: list[dict[str, str]] | None = None) -> dict[str, Any]:
         if not ID.fullmatch(run_id) or runner not in RUNNERS:
             raise ValueError("Invalid pipeline run ID or runner.")
         with self.lock():
@@ -132,6 +134,11 @@ class Pipeline:
                    "weekly_due": state["weekly"].get("cycle") != self.cycle(now),
                    "initial_targets": targets or [],
                    "verified_targets": []}
+            if initial_inbox is not None:
+                if len({n["id"] for n in initial_inbox}) != len(initial_inbox):
+                    raise ValueError("Initial inbox has duplicate note IDs.")
+                run["initial_inbox"] = initial_inbox
+                run["initial_unavailable"] = unavailable or []
             state["runs"][run_id] = run
             self.save(state)
             return run
@@ -262,6 +269,23 @@ class Pipeline:
                     raise ValueError("Completion requires a report and no pending finalizations.")
                 if run["weekly_due"] and state["weekly"].get("cycle") != run["cycle"]:
                     raise ValueError("The weekly discovery is still due; retry it before completion.")
+                if "initial_inbox" in run:
+                    if run.get("initial_unavailable"):
+                        raise ValueError("Initial inbox was incomplete; retry unavailable sources in a new run.")
+                    processed_file = self.inside("state/processed.json")
+                    processed = json.loads(processed_file.read_text()).get("processed", {}) if processed_file.exists() else {}
+                    for source in run["initial_inbox"]:
+                        entry = processed.get(source["id"], {})
+                        target = Path(entry.get("path", "")).expanduser().resolve()
+                        try:
+                            finalized = datetime.fromisoformat(entry.get("processed_at", "")) >= datetime.fromisoformat(run["started_at"]).replace(microsecond=0)
+                        except (ValueError, TypeError):
+                            finalized = False
+                        if (entry.get("status") not in {"processed", "needs-review", "rejected"}
+                                or not finalized or Path(source["path"]).exists()
+                                or not target.is_file() or not target.is_relative_to(self.root)
+                                or target.is_relative_to(self.inside("inbox"))):
+                            raise ValueError("Every initial inbox note needs a recorded finalization before completion.")
                 if any(issue["status"] == "candidate" for issue in state["issues"].values()):
                     raise ValueError("Classify every open audit candidate before completing consolidation.")
                 if any(issue.get("revalidation_required") or (
@@ -300,12 +324,32 @@ class Pipeline:
             raise ValueError("A verified completed cycle is required before preparing the release.")
         return {"weekly": state["weekly"], "consolidation": latest}
 
-    def digest(self, state: dict[str, Any], notes: list[dict[str, str]], now: datetime | None = None) -> dict[str, Any] | None:
+    def digest(self, state: dict[str, Any], notes: list[dict[str, str]], now: datetime | None = None,
+               inbox: list[dict[str, str]] | None = None) -> dict[str, Any] | None:
         now = now or datetime.now().astimezone()
         ordinary = state["threads"].get("ordinary", "")
         url = chat_url(ordinary) if ordinary else ""
         live = {note["id"]: note for note in notes}
         items = []
+        aged, unknown = [], []
+        for note in inbox or []:
+            try:
+                created = datetime.fromisoformat(note.get("created_at", ""))
+                if created.tzinfo is None:
+                    raise ValueError("Missing timezone")
+                if created > now:
+                    raise ValueError("Future creation time")
+                if now - created >= timedelta(days=1):
+                    aged.append((created, note["id"]))
+            except (ValueError, TypeError, KeyError):
+                unknown.append(note.get("id", "unknown"))
+        if aged or unknown:
+            oldest = min(aged)[0].isoformat() if aged else "unknown"
+            items.append({"id": "inbox-backlog", "status": "investigate", "title": "Inbox backlog requires assessment",
+                          "description": f"{len(aged)} inbox note(s) are at least 24 hours old; oldest: {oldest}. "
+                                         f"{len(unknown)} note(s) have an unknown creation time.",
+                          "question": "", "options": [], "chat_url": url,
+                          "note_ids": sorted([note_id for _, note_id in aged] + unknown)})
         covered = set()
         for issue in state["issues"].values():
             if issue["status"] not in OPEN and not issue.get("revalidation_required"):
@@ -427,6 +471,11 @@ def render(items: list[dict[str, Any]], language: str = "en") -> tuple[str, str]
         if item.get("chat_url"):
             text += [link_label + ": " + item["chat_url"], ""]
             content += f'<p style="margin:0"><a style="color:#175cd3;text-decoration:underline" href="{esc(item["chat_url"])}">{link_label}</a></p>'
+            fallback = ("If your mail app blocks the link, run this command in Terminal on the Mac running Codex:"
+                        if not italian else "Se la posta blocca il link, esegui questo comando nel Terminale del Mac con Codex:")
+            command = "open '" + item["chat_url"] + "'"
+            text += [fallback, command, ""]
+            content += f'<p>{fallback}<br><code>{esc(command)}</code></p>'
         blocks.append('<section style="padding:24px 0;border-bottom:1px solid #dfe3e8;overflow-wrap:anywhere;word-break:break-word">' + content + '</section>')
     markup = ('<!doctype html><html lang="' + language + '"><head><meta charset="utf-8">'
               '<meta name="viewport" content="width=device-width,initial-scale=1"></head>'

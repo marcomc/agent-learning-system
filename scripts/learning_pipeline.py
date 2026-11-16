@@ -157,12 +157,12 @@ def candidate_file_snapshot(root: Path, name: str, status: str) -> tuple[str | N
             if directory_fd != root_fd:
                 os.close(directory_fd)
             directory_fd = next_fd
-        for component in parts[:-1]:
-            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
-            if directory_fd != root_fd:
-                os.close(directory_fd)
-            directory_fd = next_fd
         try:
+            for component in parts[:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                if directory_fd != root_fd:
+                    os.close(directory_fd)
+                directory_fd = next_fd
             file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
         except FileNotFoundError:
             if "D" in status:

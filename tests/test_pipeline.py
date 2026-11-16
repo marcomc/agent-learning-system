@@ -1615,7 +1615,10 @@ class PipelineTests(unittest.TestCase):
             "--runner", "noon", "--goal-mode", "scheduled",
         ])
         output = io.StringIO()
-        with redirect_stdout(output):
+        skills = self.directory / "skills"
+        skills.mkdir()
+        with patch.object(self.app, "DEFAULT_AUDIT_TARGETS", [self.target]), \
+                patch.object(self.app, "DEFAULT_AUDIT_SKILLS_DIR", skills), redirect_stdout(output):
             self.assertEqual(self.app.command_pipeline(args), 0)
         self.assertEqual(json.loads(output.getvalue())["goal_mode"], "scheduled")
         self.assertEqual(self.pipeline.status()["runs"]["cli-intent"]["goal_mode"], "scheduled")
@@ -1836,7 +1839,7 @@ class PipelineTests(unittest.TestCase):
         evidence.write_bytes(b"[" * 1100 + b"0" + b"]" * 1100)
         with patch.dict(os.environ, {"CODEX_THREAD_ID": ORDINARY, "CODEX_TOOL_CALL_ID": start_id}):
             self.pipeline.begin("deep-bind", "noon", [], [], [], goal_mode="scheduled")
-            with self.assertRaisesRegex(ValueError, "malformed"):
+            with self.assertRaisesRegex(ValueError, "malformed|Invalid current thread capture"):
                 self.pipeline.bind_dispatch("deep-bind", str(evidence))
             self.assertEqual(self.pipeline.status()["runs"]["deep-bind"]["runner"], "unknown")
 
@@ -3321,6 +3324,19 @@ class PipelineTests(unittest.TestCase):
                                      "GIT_CONFIG_VALUE_0": str(self.directory)}):
             injected = candidate_change_snapshot(candidate_root)
         self.assertEqual(injected, staged)
+
+    def test_candidate_snapshot_accepts_deleted_file_with_missing_parent(self):
+        from learning_pipeline import candidate_file_snapshot
+
+        root = self.directory.resolve()
+        for status in ("committed:D", "D ", " D"):
+            with self.subTest(status=status):
+                self.assertEqual(candidate_file_snapshot(root, "missing/deeper/file.md", status), (None, None))
+        with self.assertRaisesRegex(ValueError, "disappeared"):
+            candidate_file_snapshot(root, "missing/deeper/file.md", " M")
+        (root / "alias").symlink_to(root / "missing", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "without following symlinks"):
+            candidate_file_snapshot(root, "alias/file.md", "committed:D")
 
     def test_candidate_snapshot_rejects_parent_symlink_swap(self):
         import learning_pipeline

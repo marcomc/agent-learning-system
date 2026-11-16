@@ -9,6 +9,17 @@ promotion; distribution parity alone does not establish integration. Attach its
 The state index owns current integration and template-promotion status; archived
 frontmatter retains the original archival decision.
 
+Before changing shared instruction context, identify affected receipt hashes
+and their current-run or release dependencies. Plan proportionate semantic
+revalidation, retaining historical evidence as provenance; do not treat stale
+hashes as verified or make unrelated historical debt an inbox precondition.
+
+When reconciling a historical target moved between worktrees, retain its original
+routing and use explicit relocation evidence: the note, prior receipt and an
+independent pre-move snapshot, plus tracked path, repository identity, worktree
+HEADs and identical reviewed candidate bytes. Do not infer equivalence from a
+path alias or an archive alone.
+
 ## Resolve and apply
 
 1. Resolve each instruction or skill's owning source and installation mode.

@@ -14,7 +14,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "agent_learning.py"
 
@@ -41,8 +40,7 @@ class AgentLearningTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--config", str(config), *args],
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=check,
             env=clean_env,
         )
@@ -80,6 +78,115 @@ class AgentLearningTests(unittest.TestCase):
             encoding="utf-8",
         )
         return config
+
+    def test_frontmatter_round_trip_preserves_json_and_escaped_text(self) -> None:
+        app = load_agent_learning_module()
+        evidence = json.dumps({"path": "/tmp/example", "sha256": "abc"})
+        fields = {"application_evidence": evidence, "text": 'quoted "value" and backslash \\ path\nnext'}
+        text = app.render_frontmatter(fields, "# Learning\n")
+        for _ in range(3):
+            actual, body = app.parse_frontmatter(text)
+            self.assertEqual(actual, fields)
+            self.assertEqual(json.loads(actual["application_evidence"])["path"], "/tmp/example")
+            text = app.render_frontmatter(actual, body)
+
+    def test_frontmatter_reads_existing_escaped_json_and_legacy_invalid_escape(self) -> None:
+        app = load_agent_learning_module()
+        raw = r'''---
+application_evidence: "{\"path\": \"/tmp/example\", \"sha256\": \"abc\"}"
+legacy: "path\qvalue"
+legacy_newline: "literal\nsequence"
+legacy_tab: "literal\tsequence"
+---
+# Note
+'''
+        data, _ = app.parse_frontmatter(raw)
+        self.assertEqual(json.loads(data["application_evidence"])["sha256"], "abc")
+        self.assertEqual(data["legacy"], r"path\qvalue")
+        self.assertEqual(data["legacy_newline"], r"literal\nsequence")
+        self.assertEqual(data["legacy_tab"], r"literal\tsequence")
+        self.assertEqual(app.parse_frontmatter(app.render_frontmatter(data, "# Note"))[0], data)
+
+    def test_frontmatter_rejects_malformed_versioned_encoding(self) -> None:
+        app = load_agent_learning_module()
+        cases = (("json-v2", r'id: "bad\qvalue"'), ("json-v3", 'id: "value"'),
+                 ("json-v2", "id: null"), ("json-v2", "id: 'note-1'"),
+                 ("json-v2", 'id: "one"\nid: "two"'), ("json-v2", "broken line"))
+        for marker, fields in cases:
+            with self.subTest(marker=marker, fields=fields), self.assertRaises(app.ConfigError):
+                app.parse_frontmatter(f"---\n# agent-learning-frontmatter: {marker}\n{fields}\n---\n# Note\n")
+
+    def test_truncated_and_duplicate_versioned_frontmatter_is_rejected(self) -> None:
+        app = load_agent_learning_module()
+        malformed = (
+            '---\n# agent-learning-frontmatter: json-v2\nid: "missing delimiter"\n',
+            '---\n# agent-learning-frontmatter: json-v2\n# agent-learning-frontmatter: json-v2\nid: "x"\n---\n# Note\n',
+        )
+        for note in malformed:
+            with self.subTest(note=note), self.assertRaises(app.ConfigError):
+                app.parse_frontmatter(note)
+        note = '---\n# another comment\n# agent-learning-frontmatter: json-v2\nid: "x"\n---\n# Note\n'
+        self.assertEqual(app.parse_frontmatter(note)[0]["id"], "x")
+
+    def test_versioned_note_requires_identity_but_legacy_fallback_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            for name, fields in (("missing", 'status: "inbox"'), ("blank", 'id: ""')):
+                (root / "inbox" / f"{name}.md").write_text(
+                    f'---\n# agent-learning-frontmatter: json-v2\n{fields}\n---\n# Invalid\n')
+            (root / "inbox" / "legacy-blank.md").write_text('---\nid: ""\n---\n# Invalid\n')
+            legacy = root / "inbox" / "legacy.md"
+            legacy.write_text('---\nstatus: "inbox"\n---\n# Legacy\n')
+            prepared = json.loads(self.run_helper(config, "prepare-run").stdout)
+            self.assertFalse(prepared["inventory_complete"])
+            self.assertEqual([n["id"] for n in prepared["inbox"]], ["legacy"])
+            self.assertEqual(len(prepared["unavailable_sources"]), 3)
+            for name in ("missing", "blank", "legacy-blank"):
+                result = self.run_helper(config, "finalize-note", "--file", str(root / "inbox" / f"{name}.md"),
+                                         "--status", "needs-review", "--rationale", "Review", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue((root / "inbox" / f"{name}.md").exists())
+            self.run_helper(config, "finalize-note", "--file", str(legacy), "--status", "needs-review",
+                            "--rationale", "Review legacy note.")
+            prepared = json.loads(self.run_helper(config, "prepare-run").stdout)
+            self.assertEqual([n["id"] for n in prepared["needs_review"]], ["legacy"])
+
+    def test_malformed_versioned_note_does_not_hide_readable_inbox(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.write_config(Path(raw))
+            root = Path(self.run_helper(config, "init-store").stdout.strip())
+            (root / "inbox" / "bad.md").write_text(
+                '---\n# agent-learning-frontmatter: json-v2\nid: null\n---\n# Bad\n')
+            (root / "inbox" / "good.md").write_text('---\nid: "good"\n---\n# Good\n')
+            prepared = json.loads(self.run_helper(config, "prepare-run").stdout)
+            self.assertFalse(prepared["inventory_complete"])
+            self.assertEqual([note["id"] for note in prepared["inbox"]], ["good"])
+            self.assertEqual(len(prepared["unavailable_sources"]), 1)
+
+    def test_applied_evidence_survives_prepare_and_review_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            target = directory / "target.txt"
+            evidence = directory / "evidence.json"
+            target.write_text("target")
+            evidence.write_text("{}")
+            self.run_helper(config, "init-store")
+            created = self.run_helper(config, "record", "--project-path", str(directory), "--source-skill", "test",
+                "--title", "Evidence survives", "--problem", "Evidence was escaped", "--root-cause", "Parser drift",
+                "--fix", "Decode", "--verification", "Checked", "--future-detection", "Read metadata",
+                "--future-prevention", "Round trip", "--application-status", "applied",
+                "--applied-target", str(target), "--application-evidence", str(evidence))
+            note = Path(created.stdout.strip())
+            before = json.loads(self.run_helper(config, "prepare-run").stdout)["inbox"][0]
+            self.assertEqual(json.loads(before["applied_targets"])[0]["path"], str(target.resolve()))
+            self.assertEqual(json.loads(before["application_evidence"])["path"], str(evidence.resolve()))
+            self.run_helper(config, "finalize-note", "--file", str(note), "--status", "needs-review",
+                            "--rationale", "Further review required.")
+            after = json.loads(self.run_helper(config, "prepare-run").stdout)["needs_review"][0]
+            self.assertEqual(json.loads(after["applied_targets"]), json.loads(before["applied_targets"]))
+            self.assertEqual(json.loads(after["application_evidence"]), json.loads(before["application_evidence"]))
 
     def test_record_creates_inbox_note(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -551,10 +658,12 @@ status: "inbox"
             root = Path(raw)
             module = load_agent_learning_module()
             lock_path = root / "state" / ".processed.lock"
+            lock_path.parent.mkdir(parents=True)
+            lock_path.write_text("existing metadata")
             for _ in range(2):
                 with module.state_update_lock(root):
                     self.assertTrue(lock_path.is_file())
-                    self.assertEqual(json.loads(lock_path.read_text())["protocol"], "flock")
+                    self.assertEqual(lock_path.read_text(), "existing metadata")
             self.assertTrue(lock_path.exists())
 
     def test_state_lock_rejects_legacy_directory_lock(self) -> None:
@@ -564,9 +673,8 @@ status: "inbox"
             lock_path.mkdir(parents=True)
             module = load_agent_learning_module()
 
-            with self.assertRaisesRegex(module.ConfigError, "Legacy directory state lock"):
-                with module.state_update_lock(root):
-                    self.fail("legacy directory lock must not be used")
+            with self.assertRaisesRegex(module.ConfigError, "Legacy directory state lock"), module.state_update_lock(root):
+                self.fail("legacy directory lock must not be used")
 
     def test_state_lock_does_not_require_hard_links(self) -> None:
         agent_learning = load_agent_learning_module()
@@ -583,7 +691,6 @@ status: "inbox"
                     lock_path = root / "state" / ".processed.lock"
                     self.assertTrue(lock_path.exists())
                     self.assertFalse(lock_path.is_symlink())
-                    self.assertEqual(json.loads(lock_path.read_text())["protocol"], "flock")
             finally:
                 agent_learning.os.link = original_link
 
@@ -901,36 +1008,35 @@ status: "inbox"
             f"Do not write {workspace_path} into shared handoffs.",
         ]
         for candidate_rule in candidate_rules:
-            with self.subTest(candidate_rule=candidate_rule):
-                with tempfile.TemporaryDirectory() as raw:
-                    directory = Path(raw)
-                    config = self.write_config(directory)
-                    template_repo = directory / "templates"
-                    template_repo.mkdir()
-                    (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
-                    result = self.run_helper(
-                        config,
-                        "create-template-draft",
-                        "--template-repo",
-                        str(template_repo),
-                        "--lesson-family",
-                        "private-path",
-                        "--source-note",
-                        "note.md",
-                        "--proposed-template",
-                        "docs",
-                        "--candidate-rule",
-                        candidate_rule,
-                        "--prevention-target",
-                        "atom:docs",
-                        "--privacy-verdict",
-                        "clean",
-                        "--enforce-routing",
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode, 2)
-                    self.assertIn("must be scrubbed", result.stderr)
-                    self.assertFalse((template_repo / ".work").exists())
+            with self.subTest(candidate_rule=candidate_rule), tempfile.TemporaryDirectory() as raw:
+                directory = Path(raw)
+                config = self.write_config(directory)
+                template_repo = directory / "templates"
+                template_repo.mkdir()
+                (template_repo / "templates.yml").write_text("templates: []\n", encoding="utf-8")
+                result = self.run_helper(
+                    config,
+                    "create-template-draft",
+                    "--template-repo",
+                    str(template_repo),
+                    "--lesson-family",
+                    "private-path",
+                    "--source-note",
+                    "note.md",
+                    "--proposed-template",
+                    "docs",
+                    "--candidate-rule",
+                    candidate_rule,
+                    "--prevention-target",
+                    "atom:docs",
+                    "--privacy-verdict",
+                    "clean",
+                    "--enforce-routing",
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("must be scrubbed", result.stderr)
+                self.assertFalse((template_repo / ".work").exists())
 
     def test_notify_refuses_placeholder_email_for_msmtp(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1200,6 +1306,114 @@ description: Use when reviewing and fixing a branch before PR review.
             text = repository_skill.read_text(encoding="utf-8")
             self.assertEqual(text.count("BEGIN RECORD AGENT LEARNING HOOK"), 1)
 
+    def test_partial_goal_resumes_across_cli_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            home = directory / "home"
+            home.mkdir()
+            (home / "AGENTS.md").write_text("# Rules\n\n- Retain evidence.\n", encoding="utf-8")
+            (home / ".agents" / "skills").mkdir(parents=True)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("AGENT_LEARNING_") and key not in {"CODEX_HOME", "XDG_CONFIG_HOME"}}
+            env["HOME"] = str(home)
+
+            def cli(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                return subprocess.run([sys.executable, str(SCRIPT), "--config", str(config), *args],
+                                      text=True, capture_output=True, check=check, env=env)
+
+            ordinary = "11111111-1111-1111-1111-111111111111"
+            release = "22222222-2222-2222-2222-222222222222"
+            cli("init-store")
+            cli("pipeline-configure", "--ordinary-thread", ordinary, "--release-thread", release)
+            store = directory / "learning-base" / "AI Agent Learnings"
+            for name in ("first", "second"):
+                (store / "inbox" / f"{name}.md").write_text(
+                    f'---\nid: "{name}"\nstatus: "inbox"\n---\n# {name.title()}\n', encoding="utf-8")
+            baseline = json.loads(cli("pipeline-begin", "--run-id", "baseline", "--runner", "midnight", "--goal-mode", "scheduled").stdout)
+            initial = baseline["initial_fingerprint"]
+            cli("pipeline-goal-attempt", "--run-id", "baseline", "--goal-thread-id", ordinary)
+            receipt = store / "reports" / "active.json"
+            receipt.write_text(json.dumps({"goal": {"threadId": ordinary, "status": "active", "createdAt": int(time.time()),
+                               "objective": f"Agent Learning baseline baseline {initial}"}}), encoding="utf-8")
+            cli("pipeline-goal-bind", "--run-id", "baseline", "--initial-fingerprint", initial,
+                "--goal-thread-id", ordinary, "--goal-receipt", str(receipt))
+            cli("finalize-note", "--run-id", "baseline", "--file", str(store / "inbox" / "first.md"),
+                "--status", "needs-review", "--rationale", "The first source was assessed.")
+            partial = json.loads(cli("pipeline-finish", "--run-id", "baseline", "--status", "partial",
+                                     "--summary", "Continue the remaining source.").stdout)
+            self.assertEqual([item["id"] for item in partial["initial_assessment"]["unassessed"]], ["second"])
+            status_args = ("pipeline-goal-status", "--run-id", "baseline", "--initial-fingerprint", initial)
+            self.assertFalse(json.loads(cli(*status_args).stdout)["accounting_complete"])
+            cli("pipeline-begin", "--run-id", "retry", "--runner", "midnight", "--goal-mode", "scheduled")
+            cli("finalize-note", "--run-id", "retry", "--file", str(store / "inbox" / "second.md"),
+                "--status", "needs-review", "--rationale", "The second source was assessed.")
+            cli("pipeline-finish", "--run-id", "retry", "--status", "partial", "--summary", "Review pending.")
+            result = json.loads(cli(*status_args).stdout)
+            self.assertTrue(result["accounting_complete"])
+            self.assertEqual({item["note_id"] for item in result["needs_review"]}, {"first", "second"})
+            sealed = cli(*status_args, "--seal", "--goal-receipt", str(receipt), check=False)
+            self.assertNotEqual(sealed.returncode, 0)
+            self.assertIn("current residual review receipt", sealed.stderr)
+
+    def test_interrupted_goal_completes_and_allows_next_scheduled_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            config = self.write_config(directory)
+            home = directory / "home"
+            home.mkdir()
+            (home / "AGENTS.md").write_text("# Rules\n\n- Retain evidence.\n", encoding="utf-8")
+            (home / ".agents" / "skills").mkdir(parents=True)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("AGENT_LEARNING_") and key not in {"CODEX_HOME", "XDG_CONFIG_HOME"}}
+            env["HOME"] = str(home)
+
+            def cli(*args: str) -> dict:
+                result = subprocess.run([sys.executable, str(SCRIPT), "--config", str(config), *args],
+                                        text=True, capture_output=True, check=True, env=env)
+                return json.loads(result.stdout) if result.stdout.lstrip().startswith("{") else {}
+
+            ordinary = "11111111-1111-1111-1111-111111111111"
+            release = "22222222-2222-2222-2222-222222222222"
+            cli("init-store")
+            cli("pipeline-configure", "--ordinary-thread", ordinary, "--release-thread", release)
+            store = directory / "learning-base" / "AI Agent Learnings"
+            for name in ("first", "second"):
+                (store / "inbox" / f"{name}.md").write_text(
+                    f'---\nid: "{name}"\nstatus: "inbox"\n---\n# {name.title()}\n', encoding="utf-8")
+            baseline = cli("pipeline-begin", "--run-id", "baseline", "--runner", "noon", "--goal-mode", "scheduled")
+            initial = baseline["initial_fingerprint"]
+            cli("pipeline-goal-attempt", "--run-id", "baseline", "--goal-thread-id", ordinary)
+            created_at = int(time.time())
+            receipt = store / "reports" / "goal.json"
+
+            def save_receipt(status: str) -> None:
+                receipt.write_text(json.dumps({"goal": {"threadId": ordinary, "status": status,
+                                   "createdAt": created_at,
+                                   "objective": f"Agent Learning baseline baseline {initial}"}}), encoding="utf-8")
+
+            save_receipt("active")
+            cli("pipeline-goal-bind", "--run-id", "baseline", "--initial-fingerprint", initial,
+                "--goal-thread-id", ordinary, "--goal-receipt", str(receipt))
+            cli("finalize-note", "--run-id", "baseline", "--file", str(store / "inbox" / "first.md"),
+                "--status", "rejected", "--rationale", "The first fixture is not reusable.")
+            cli("pipeline-finish", "--run-id", "baseline", "--status", "partial", "--summary", "Continue later.")
+            status_args = ("pipeline-goal-status", "--run-id", "baseline", "--initial-fingerprint", initial)
+            self.assertFalse(cli(*status_args)["accounting_complete"])
+            retry = cli("pipeline-begin", "--run-id", "retry", "--runner", "noon", "--goal-mode", "scheduled")
+            self.assertEqual(retry["goal_baseline"]["run_id"], "baseline")
+            cli("finalize-note", "--run-id", "retry", "--file", str(store / "inbox" / "second.md"),
+                "--status", "rejected", "--rationale", "The second fixture is not reusable.")
+            cli("pipeline-finish", "--run-id", "retry", "--status", "partial", "--summary", "Both assessed.")
+            sealed = cli(*status_args, "--seal", "--goal-receipt", str(receipt))
+            self.assertTrue(sealed["sealed"])
+            save_receipt("complete")
+            advanced = cli("pipeline-goal-advance", "--run-id", "baseline", "--initial-fingerprint", initial,
+                           "--sealed-at", sealed["sealed_at"], "--goal-receipt", str(receipt))
+            self.assertEqual(advanced["status"], "closed")
+            next_run = cli("pipeline-begin", "--run-id", "next", "--runner", "noon", "--goal-mode", "scheduled")
+            self.assertNotIn("goal_baseline", next_run)
+
     def test_audit_rules_detects_duplicates_and_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)
@@ -1209,28 +1423,11 @@ description: Use when reviewing and fixing a branch before PR review.
             file_a = rules_dir / "a.md"
             file_b = rules_dir / "b.md"
             file_a.write_text(
-                "\n".join(
-                    [
-                        "# Rules",
-                        "",
-                        "- Always require a negative-path test when rejecting legacy inputs.",
-                        "- Prefer wrapper commands for common flags.",
-                        "",
-                    ]
-                ),
+                "# Rules\n\n- Always require a negative-path test when rejecting legacy inputs.\n- Prefer wrapper commands for common flags.\n",
                 encoding="utf-8",
             )
             file_b.write_text(
-                "\n".join(
-                    [
-                        "# More rules",
-                        "",
-                        "- Always require a negative path test when rejecting legacy inputs.",
-                        "- Prefer wrapper command for common flags.",
-                        "- Allow wrapper commands to be bypassed without documenting setup steps.",
-                        "",
-                    ]
-                ),
+                "# More rules\n\n- Always require a negative path test when rejecting legacy inputs.\n- Prefer wrapper command for common flags.\n- Allow wrapper commands to be bypassed without documenting setup steps.\n",
                 encoding="utf-8",
             )
             result = self.run_helper(config, "audit-rules", "--path", str(rules_dir), "--all-md")

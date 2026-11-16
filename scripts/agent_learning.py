@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import redirect_stdout
 from contextlib import contextmanager
 import difflib
@@ -29,10 +29,8 @@ from typing import Any
 
 # Support direct CLI execution and file-based imports used by the test harness.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from learning_pipeline import Pipeline, chat_url, snapshot
-from learning_integration import verify as verify_integration, validate_receipt
-from learning_integration import verify_distribution
-from learning_coherence import verify_coherence
+from learning_pipeline import Pipeline, RULE_PARSER_VERSION, chat_url, check_sealed_file, current_audit_sources, current_refs, fingerprint, read_store_state, release_assessment_skeleton, snapshot
+from learning_integration import concrete_routing_target_path
 
 try:
     import fcntl
@@ -134,20 +132,16 @@ ROUTING_SCOPES = (
 )
 TEMPLATE_UPSTREAM_STATUSES = ("not-applicable", "draft-created", "promoted", "deferred")
 RECURRENCE_CHECKS = ("new", "duplicate-before-promotion", "duplicate-after-prevention")
-ROUTING_TARGET_SCHEMES = {
-    "atom",
-    "global",
-    "needs-review",
-    "project-local",
-    "skill",
-    "skill-detection",
-    "skill-prevention",
-}
 STATE_LOCK_TIMEOUT_SECONDS = float(os.environ.get("AGENT_LEARNING_STATE_LOCK_TIMEOUT_SECONDS", "10.0"))
+GOAL_SEAL_TIMEOUT_SECONDS = 6.0
 
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing."""
+
+
+class EvidenceUnavailable(ConfigError):
+    """A bounded evidence read could not establish the file contents."""
 
 
 def now_iso() -> str:
@@ -197,7 +191,11 @@ def ensure_store(root: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
     state_path = root / "state" / "processed.json"
     with state_update_lock(root):
-        if not state_path.exists():
+        try:
+            current = read_store_state(root, "processed.json", 8, probe_only=True)
+        except ValueError as exc:
+            raise EvidenceUnavailable("Processed state is unavailable; retry after storage recovery.") from exc
+        if current is None:
             atomic_write_text(state_path, json.dumps({"processed": {}}, indent=2) + "\n")
 
 
@@ -206,32 +204,58 @@ def slugify(value: str) -> str:
     return slug[:64] or "learning"
 
 
-def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+def parse_frontmatter(text: str, *, require_note_identity: bool = False) -> tuple[dict[str, str], str]:
     if not text.startswith("---\n"):
         return {}, text
     end = text.find("\n---\n", 4)
+    marker_prefix = "# agent-learning-frontmatter:"
     if end == -1:
+        if any(line.strip().startswith(marker_prefix) for line in text[4:].splitlines()):
+            raise ConfigError("Truncated encoded agent learning frontmatter.")
         return {}, text
     raw_fm = text[4:end]
     body = text[end + 5 :]
     data: dict[str, str] = {}
-    for raw in raw_fm.splitlines():
+    lines = raw_fm.splitlines()
+    marker = "# agent-learning-frontmatter: json-v2"
+    markers = [line.strip() for line in lines if line.strip().startswith(marker_prefix)]
+    if markers and markers != [marker]:
+        raise ConfigError("Unsupported agent learning frontmatter encoding.")
+    encoded = bool(markers)
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
         if ":" not in raw:
+            if encoded:
+                raise ConfigError("Malformed encoded agent learning frontmatter.")
             continue
         key, value = raw.split(":", 1)
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        key, value = key.strip(), value.strip()
+        if encoded:
+            if not key or key in data:
+                raise ConfigError("Malformed encoded agent learning frontmatter.")
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ConfigError("Malformed encoded agent learning frontmatter.") from exc
+            if not isinstance(value, str):
+                raise ConfigError("Malformed encoded agent learning frontmatter.")
+        elif len(value) >= 2 and value[0] == value[-1] == '"':
+            # The legacy renderer escaped quotes but left other backslashes literal.
+            value = value[1:-1].replace('\\"', '"')
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
             value = value[1:-1]
-        data[key.strip()] = value
+        data[key] = value
+    if encoded and require_note_identity and not data.get("id", "").strip():
+        raise ConfigError("Encoded learning note requires a nonempty identity.")
     return data, body
 
 
 def render_frontmatter(data: dict[str, str], body: str) -> str:
-    lines = ["---"]
+    lines = ["---", "# agent-learning-frontmatter: json-v2"]
     for key in sorted(data):
         value = data[key]
-        safe = value.replace('"', '\\"')
-        lines.append(f'{key}: "{safe}"')
+        lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
     lines.append("---")
     return "\n".join(lines) + "\n" + body.lstrip("\n")
 
@@ -404,19 +428,6 @@ def validate_routing_values(metadata: dict[str, Any]) -> None:
         raise ConfigError(f"Unsupported recurrence check: {recurrence}")
 
 
-def concrete_routing_target_path(value: str) -> Path | None:
-    """Resolve file targets; logical schemes accept only extensionless leaf labels."""
-    scheme, separator, target = value.partition(":")
-    if separator and scheme in ROUTING_TARGET_SCHEMES:
-        if (target and "/" not in target and "\\" not in target
-                and not target.startswith((".", "~"))
-                and not Path(target).suffix):
-            return None
-        if target:
-            return Path(target).expanduser().resolve()
-    return Path(value).expanduser().resolve()
-
-
 def enforce_routing_contract(metadata: dict[str, Any]) -> None:
     family = str(metadata.get("lesson_family", "")).strip()
     scope = str(metadata.get("scope", "")).strip()
@@ -525,10 +536,6 @@ def state_update_lock(root: Path):
                 if time.monotonic() >= deadline:
                     raise ConfigError(f"Timed out waiting for state lock: {lock_path}") from exc
                 time.sleep(0.05)
-        lock_file.seek(0)
-        lock_file.write(json.dumps({"protocol": "flock", "pid": os.getpid()}) + "\n")
-        lock_file.truncate()
-        lock_file.flush()
         yield
     finally:
         try:
@@ -740,14 +747,29 @@ def ensure_review_block(body: str) -> str:
     return body.rstrip() + "\n\n" + REVIEW_BLOCK
 
 
+def review_stable_digest(text: str) -> str | None:
+    """Bind a review note while allowing edits only inside its decision block."""
+    if text.count(REVIEW_BEGIN) != 1 or text.count(REVIEW_END) != 1:
+        return None
+    start = text.index(REVIEW_BEGIN) + len(REVIEW_BEGIN)
+    end = text.find(REVIEW_END, start)
+    if end < 0:
+        return None
+    stable = text[:start] + text[end:]
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
 def note_summary(path: Path, raw: bytes | None = None) -> dict[str, str]:
     raw = path.read_bytes() if raw is None else raw
     text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    fm, body = parse_frontmatter(text)
+    fm, body = parse_frontmatter(text, require_note_identity=True)
+    note_id = fm.get("id", path.stem)
+    if not note_id.strip():
+        raise ConfigError("Learning note requires a nonempty identity.")
     decision, checked = checkbox_decision(body)
     return {
         "path": str(path),
-        "id": fm.get("id", path.stem),
+        "id": note_id,
         "created_at": fm.get("created_at", ""),
         "title": body.splitlines()[0].lstrip("# ").strip() if body.splitlines() else path.stem,
         "project_path": fm.get("project_path", ""),
@@ -775,15 +797,28 @@ def read_note_bounded(path: Path) -> bytes:
     return result.stdout
 
 
-def bounded_note_inventory(root: Path, paths: list[Path]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def bounded_note_inventory(root: Path, paths: list[Path], *, timeout: float | None = None) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     def inspect(path: Path) -> tuple[dict[str, str] | None, dict[str, str] | None]:
         try:
             resolved = validate_note_source(root, path)
             return note_summary(path, read_note_bounded(resolved)), None
         except (ConfigError, OSError, UnicodeError, subprocess.CalledProcessError):
             return None, {"path": str(path), "reason": "unavailable or unreadable"}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(inspect, paths))
+    executor = ThreadPoolExecutor(max_workers=8)
+    try:
+        if timeout is None:
+            results = list(executor.map(inspect, paths))
+        else:
+            futures = [executor.submit(inspect, path) for path in paths]
+            done, _ = wait(futures, timeout=timeout)
+            results = []
+            for path, future in zip(paths, futures):
+                try:
+                    results.append(future.result() if future in done else (None, {"path": str(path), "reason": "unavailable or unreadable"}))
+                except Exception:
+                    results.append((None, {"path": str(path), "reason": "unavailable or unreadable"}))
+    finally:
+        executor.shutdown(wait=timeout is None, cancel_futures=True)
     return ([note for note, _ in results if note is not None],
             [failure for _, failure in results if failure is not None])
 
@@ -880,14 +915,20 @@ def command_prepare_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def load_state(root: Path) -> dict[str, Any]:
+def load_state(root: Path, *, deadline: float | None = None) -> dict[str, Any]:
     state_path = root / "state" / "processed.json"
-    if state_path.exists():
-        try:
-            return json.loads(state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"State file is malformed: {state_path}") from exc
-    return {"processed": {}}
+    try:
+        if deadline is None:
+            deadline = time.monotonic() + 8
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EvidenceUnavailable("Processed state timed out; retry after storage recovery.")
+        raw = read_store_state(root, "processed.json", remaining)
+        return json.loads(raw) if raw is not None else {"processed": {}}
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"State file is malformed: {state_path}") from exc
+    except ValueError as exc:
+        raise EvidenceUnavailable("Processed state is unavailable or timed out; retry after storage recovery.") from exc
 
 
 def save_state(root: Path, state: dict[str, Any]) -> None:
@@ -1123,10 +1164,23 @@ def command_finalize_note(args: argparse.Namespace) -> int:
         state = load_state(root)
         recover_finalizations(root, state)
         source = validate_note_source(root, Path(args.file))
-        original_text = source.read_text(encoding="utf-8")
-        fm, body = parse_frontmatter(original_text)
+        original_bytes = source.read_bytes()
+        original_text = original_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        fm, body = parse_frontmatter(original_text, require_note_identity=True)
         note_id = fm.get("id", source.stem)
+        if not note_id.strip():
+            raise ConfigError("Learning note requires a nonempty identity.")
+        fm.setdefault("id", note_id)
         status = args.status
+        pipeline_state = pipeline_store(root).load()
+        active_runs = [r for r in pipeline_state["runs"].values() if r.get("status") == "running"]
+        if len(active_runs) > 1:
+            raise ConfigError("Multiple active runs need reconciliation before finalization.")
+        active = active_runs[0] if active_runs else None
+        if args.run_id and (not active or active.get("id") != args.run_id):
+            raise ConfigError("Finalization run ID must identify the active consolidation.")
+        if active and not args.run_id:
+            raise ConfigError("Finalization during an active consolidation requires the active --run-id.")
         routing = routing_from_args(args, fm, body, source)
         if args.enforce_routing:
             enforce_routing_contract(routing)
@@ -1136,6 +1190,8 @@ def command_finalize_note(args: argparse.Namespace) -> int:
         fm["processing_rationale"] = args.rationale
         if args.run_id:
             fm["consolidation_run"] = args.run_id
+        else:
+            fm.pop("consolidation_run", None)
         if status == "needs-review":
             fm["review_reason"] = args.rationale
             body = ensure_review_block(body)
@@ -1154,12 +1210,40 @@ def command_finalize_note(args: argparse.Namespace) -> int:
         store_directory(root, dest.parent).mkdir(parents=True, exist_ok=True)
         final = dest if source == dest.resolve() else unique_path(dest)
         result_text = render_frontmatter(fm, body)
+        source_hash = hashlib.sha256(original_bytes).hexdigest()
+        previous = state.get("processed", {}).get(note_id, {})
+        lineage = []
+        same_archive = previous.get("archive_sha256") == source_hash
+        decision_only = (previous.get("status") == "needs-review"
+                         and previous.get("archive_review_stable_sha256")
+                         and previous["archive_review_stable_sha256"] == review_stable_digest(original_text))
+        if ((same_archive or decision_only) and previous.get("path")
+                and Path(previous["path"]).expanduser().resolve() == source):
+            lineage = list(previous.get("source_lineage", []))
+        source_ref = {"path": str(source), "sha256": source_hash}
+        if source_ref not in lineage:
+            lineage.append(source_ref)
         entry = {
             "path": str(final), "status": status, "processed_at": fm["processed_at"],
+            "source_path": str(source), "source_sha256": source_hash, "source_lineage": lineage,
+            "archive_sha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
             "rationale": args.rationale, **routing_state_payload(routing), **review_metadata,
         }
+        if args.run_id:
+            entry["consolidation_run"] = args.run_id
+        prior_runs = previous.get("consolidation_runs", [])
+        prior_run = previous.get("consolidation_run", "") if previous.get("status") == "processed" else ""
+        if (not isinstance(prior_runs, list) or any(not isinstance(value, str) for value in prior_runs)
+                or not isinstance(prior_run, str)):
+            raise ConfigError("Stored consolidation membership is invalid; reconcile before finalization.")
+        run_history = list(dict.fromkeys([*prior_runs, *([prior_run] if prior_run else []),
+                                        *([args.run_id] if args.run_id and status == "processed" else [])]))
+        if run_history:
+            entry["consolidation_runs"] = run_history
         if status == "processed":
             entry["integration_status"] = "pending"
+        if status == "needs-review":
+            entry["archive_review_stable_sha256"] = review_stable_digest(result_text)
         for key in ("capture_key", "capture_digest"):
             if key in fm:
                 entry[key] = fm[key]
@@ -1187,13 +1271,29 @@ def command_finalize_note(args: argparse.Namespace) -> int:
     return 0
 
 
-def validate_residual_review(root: Path, notes: list[dict[str, str]], evidence: str) -> dict[str, int]:
+def read_before_deadline(path: Path, deadline: float | None, *, max_bytes: int | None = None) -> bytes:
+    if deadline is None:
+        return path.read_bytes()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise EvidenceUnavailable("Evidence revalidation timed out; retry the check.")
+    try:
+        command = ["/usr/bin/head", "-c", str(max_bytes + 1), str(path)] if max_bytes is not None else ["/bin/cat", str(path)]
+        content = subprocess.run(command, capture_output=True, check=True, timeout=remaining).stdout
+        if max_bytes is not None and len(content) > max_bytes:
+            raise EvidenceUnavailable("Evidence exceeds the bounded read limit; reconcile before retrying.")
+        return content
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EvidenceUnavailable("Evidence is unavailable or timed out; retry the check.") from exc
+
+
+def validate_residual_review(root: Path, notes: list[dict[str, str]], evidence: str, *, deadline: float | None = None, content: bytes | None = None) -> dict[str, int]:
     """Require an accounted-for residual queue; semantic judgments remain with the reviewer."""
     receipt = Path(evidence).expanduser().resolve()
     if not receipt.is_relative_to((root / "reports").resolve()) or not receipt.is_file():
         raise ConfigError("Review evidence must be a saved JSON receipt inside configured reports.")
     try:
-        data = json.loads(receipt.read_bytes())
+        data = json.loads(content if content is not None else read_before_deadline(receipt, deadline))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ConfigError("Invalid residual review JSON.") from exc
     if (not isinstance(data, dict) or data.get("version") != 1 or data.get("scope") != "instructions-only"
@@ -1230,7 +1330,7 @@ def validate_residual_review(root: Path, notes: list[dict[str, str]], evidence: 
                 path = Path(target["path"]).expanduser().resolve()
                 if not path.is_file() or not instruction_target(path, root):
                     raise ConfigError("Residual target must be an existing instruction file outside the learning store.")
-                if hashlib.sha256(path.read_bytes()).hexdigest() != target.get("sha256"):
+                if hashlib.sha256(read_before_deadline(path, deadline)).hexdigest() != target.get("sha256"):
                     raise ConfigError("Stale residual instruction target; reassess ownership and exact overlap.")
         else:
             raise ConfigError("Finalize resolved technical notes before reporting; pending notes need investigate or needs-user decisions.")
@@ -1618,7 +1718,303 @@ def command_send_email(args: argparse.Namespace) -> int:
 
 
 def pipeline_store(root: Path) -> Pipeline:
-    return Pipeline(root, lambda: state_update_lock(root))
+    def read_finalized(path: Path) -> dict[str, str] | None:
+        try:
+            return note_summary(path, read_note_bounded(path))
+        except (OSError, UnicodeError, subprocess.CalledProcessError):
+            return None
+    def verify_sealed(pipeline: Pipeline, state: dict, cycle: dict, deadline: float) -> list[dict]:
+        def remaining() -> float:
+            result = deadline - time.monotonic()
+            if result <= 0:
+                raise ValueError("Sealed evidence is unavailable or timed out; retry.")
+            return result
+        snapshot = cycle.get("sealed_snapshot")
+        if not isinstance(snapshot, dict):
+            return [{"id": cycle["run_id"], "kind": "legacy-seal", "expected_sha256": None,
+                     "observed_sha256": fingerprint(cycle), "reason": "The legacy seal lacks per-source evidence."}]
+        reference = {"run_id": cycle["run_id"], "initial_fingerprint": cycle["initial_fingerprint"]}
+        runs = {key: value for key, value in state["runs"].items() if value.get("goal_baseline") == reference}
+        run_fingerprint = fingerprint(runs)
+        raw = read_store_state(root, "processed.json", remaining())
+        if raw is None:
+            raise ValueError("Processed state is unavailable; retry before advancing.")
+        index = json.loads(raw)
+        entries = index.get("processed")
+        if not isinstance(entries, dict):
+            raise ValueError("Processed state is malformed; reconcile before advancing.")
+        drifts: list[dict] = []
+        if run_fingerprint != snapshot.get("runs_fingerprint"):
+            drifts.append({"id": cycle["run_id"], "kind": "run-record", "expected_sha256": snapshot.get("runs_fingerprint"),
+                           "observed_sha256": run_fingerprint, "reason": "The sealed run records changed."})
+        def check_file(item_id: str, kind: str, ref: dict) -> tuple[bool, dict | None, Any]:
+            return check_sealed_file(root, item_id, kind, ref, remaining())
+        def parallel(tasks: dict, function) -> dict:
+            executor = ThreadPoolExecutor(max_workers=8)
+            try:
+                futures = {executor.submit(function, *args): key for key, args in tasks.items()}
+                done, unfinished = wait(futures, timeout=remaining())
+                if unfinished:
+                    raise ValueError("Sealed evidence is unavailable or timed out; retry.")
+                return {futures[future]: future.result() for future in done}
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        file_tasks = {}
+        active_entries = {}
+        for note_id, original in snapshot["outcomes"].items():
+            entry = entries.get(note_id)
+            expected = original["entry_fingerprint"]
+            observed = fingerprint(entry)
+            if observed != expected:
+                drifts.append({"id": note_id, "kind": "outcome", "expected_sha256": expected,
+                               "observed_sha256": observed, "reason": "The saved outcome changed."})
+                continue
+            active_entries[note_id] = entry
+            archive_kind = "archive-review" if entry.get("status") == "needs-review" else "archive-processed"
+            file_tasks[(note_id, "archive")] = (note_id, archive_kind, original["archive"])
+            if entry.get("status") == "processed":
+                file_tasks[(note_id, "integration-receipt")] = (note_id, "integration-receipt", entry.get("integration_receipt", {}))
+        for note_id, review in snapshot["reviews"].items():
+            file_tasks[(note_id, "review")] = (note_id, "review", {"path": review["path"], "sha256": review["sha256"]})
+        bindings = snapshot.get("review_issues", {})
+        binding_version = snapshot.get("review_binding_version")
+        anchor_version = cycle.get("review_binding_version")
+        # Entirely unmarked snapshots retain legacy behavior; this local state is not authenticated.
+        if (("review_binding_version" in snapshot or "review_binding_version" in cycle or "review_issues" in snapshot)
+                and (type(binding_version) is not int or binding_version != 1
+                     or type(anchor_version) is not int or anchor_version != 1)):
+            raise ValueError("Unknown sealed review binding version; reconcile the cycle.")
+        if (not isinstance(bindings, dict) or (binding_version == 1
+                and set(bindings) != set(snapshot["reviews"]))):
+            raise ValueError("Sealed review issue bindings are incomplete; reconcile the cycle.")
+        for note_id, binding in bindings.items():
+            issue = state.get("issues", {}).get(binding["id"])
+            observed = fingerprint(issue)
+            if observed != binding["fingerprint"]:
+                drifts.append({"id": note_id, "kind": "review-issue", "expected_sha256": binding["fingerprint"],
+                               "observed_sha256": observed, "reason": "The linked review classification changed."})
+        receipt = snapshot.get("review_receipt")
+        if snapshot["reviews"] and not receipt:
+            raise ValueError("Sealed review receipt is missing; reconcile the cycle.")
+        if receipt:
+            file_tasks[("review-receipt", "review-receipt")] = ("review-receipt", "review-receipt", receipt)
+        file_results = parallel(file_tasks, check_file)
+        drifts.extend(result[1] for result in file_results.values() if result[1] is not None)
+        receipt_tasks = {}
+        note_receipts = {}
+        for note_id, entry in active_entries.items():
+            if entry.get("status") != "processed" or not file_results[(note_id, "archive")][0] or not file_results[(note_id, "integration-receipt")][0]:
+                continue
+            ref = entry["integration_receipt"]
+            key = json.dumps(ref, sort_keys=True)
+            note_receipts[note_id] = key
+            receipt_tasks[key] = (ref,)
+        def inspect(ref: dict) -> dict:
+            return inspect_receipt_bounded(ref, timeout=min(8, remaining()))
+        receipt_results = parallel(receipt_tasks, inspect)
+        for note_id, key in note_receipts.items():
+            result = receipt_results[key]
+            if result["status"] == "unavailable":
+                raise ValueError("Sealed integration evidence is unavailable; retry.")
+            if result["status"] != "verified" or note_id not in result.get("note_ids", []):
+                ref = active_entries[note_id]["integration_receipt"]
+                drifts.append({"id": note_id, "kind": "integration", "expected_sha256": ref.get("sha256"),
+                               "observed_sha256": ref.get("sha256"), "reason": "The unchanged integration receipt no longer verifies.",
+                               "detail": result.get("reason", "Receipt does not cover this note.")})
+        reviews_current = all(file_results[(note_id, "review")][0] for note_id in snapshot["reviews"])
+        receipt_current = file_results[("review-receipt", "review-receipt")][0] if receipt else True
+        if reviews_current and receipt_current and receipt:
+            receipt_bytes = file_results[("review-receipt", "review-receipt")][2]
+            notes = [file_results[(note_id, "review")][2] for note_id in snapshot["reviews"]]
+            for note in notes:
+                try:
+                    validate_residual_review(root, [note], receipt["path"], deadline=deadline, content=receipt_bytes)
+                except EvidenceUnavailable:
+                    raise
+                except ConfigError as exc:
+                    drifts.append({"id": note["id"], "kind": "review-contract", "expected_sha256": receipt["sha256"],
+                                   "observed_sha256": None, "reason": "The residual review evidence no longer verifies.", "detail": str(exc)})
+            valid, _, _ = check_file("review-receipt", "review-receipt", receipt)
+            if not valid:
+                raise ValueError("Review receipt changed during verification; retry.")
+        remaining()
+        return drifts
+    def verify_recovery(pipeline: Pipeline, state: dict, record: dict, deadline: float) -> dict:
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise ValueError("Recovery evidence timed out; retry.")
+            return value
+        def parallel_check(items: list, fn) -> None:
+            if not items:
+                return
+            executor = ThreadPoolExecutor(max_workers=min(8, len(items)))
+            try:
+                futures = [executor.submit(fn, item) for item in items]
+                done, pending = wait(futures, timeout=remaining())
+                if pending:
+                    raise ValueError("Recovery evidence timed out; retry.")
+                for future in done:
+                    future.result()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        run_id, followup_ids = record.get("run_id"), record.get("followup_ids")
+        run = state.get("runs", {}).get(run_id)
+        if (not isinstance(run_id, str) or not isinstance(followup_ids, list) or not followup_ids
+                or len(followup_ids) > 32 or any(not isinstance(key, str) or key == run_id for key in followup_ids)
+                or len(set(followup_ids)) != len(followup_ids) or not isinstance(run, dict)
+                or run.get("id") != run_id or run.get("status") not in {"partial", "failed"}
+                or fingerprint(run) != record.get("run_fingerprint")
+                or not isinstance(record.get("followup_fingerprints"), dict)
+                or set(record["followup_fingerprints"]) != set(followup_ids)):
+            raise ValueError("Recovery requires unchanged terminal and completed follow-up runs.")
+        followups = {key: state.get("runs", {}).get(key) for key in followup_ids}
+        for key, followup in followups.items():
+            if (not isinstance(followup, dict) or followup.get("id") != key
+                    or followup.get("status") != "completed"
+                    or fingerprint(followup) != record["followup_fingerprints"][key]):
+                raise ValueError("Recovery requires unchanged terminal and completed follow-up runs.")
+            try:
+                if datetime.fromisoformat(followup["started_at"]) < datetime.fromisoformat(run["finished_at"]):
+                    raise ValueError("The follow-up began before the interrupted run finished.")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Recovery needs a later completed follow-up.") from exc
+        initial = run.get("initial_inbox")
+        unavailable = run.get("initial_unavailable", [])
+        if (not isinstance(initial, list) or unavailable
+                or run.get("initial_fingerprint") != fingerprint({"inbox": initial, "unavailable": unavailable})):
+            raise ValueError("Recovery needs a complete unchanged original inbox snapshot.")
+        prior_assessment = run.get("initial_assessment")
+        if (not isinstance(prior_assessment, dict) or not prior_assessment.get("known")
+                or prior_assessment.get("unavailable") or not isinstance(prior_assessment.get("unassessed"), list)):
+            raise ValueError("Original completion assessment is unavailable; reconcile its scope first.")
+        if (any(not isinstance(item, dict) or not isinstance(item.get("id"), str) for item in initial)
+                or len({item["id"] for item in initial}) != len(initial)
+                or any(item not in initial for item in prior_assessment["unassessed"])):
+            raise ValueError("Original completion assessment does not match its inbox snapshot.")
+        if run.get("weekly_due"):
+            weekly = state.get("weekly", {})
+            if (weekly.get("cycle") != run.get("cycle") or weekly.get("run_id") not in [run_id, *followup_ids]
+                    or not isinstance(weekly.get("snapshot"), dict)):
+                raise ValueError("The interrupted run's weekly audit is not verified.")
+            valid, _, weekly_raw = check_sealed_file(root, run_id, "goal-receipt", weekly["snapshot"], remaining())
+            try:
+                weekly_payload = json.loads(weekly_raw) if valid else None
+            except (ValueError, TypeError, RecursionError) as exc:
+                raise ValueError("The interrupted run's weekly audit is not verified.") from exc
+            if (not isinstance(weekly_payload, dict) or weekly_payload.get("run_id") != weekly["run_id"]
+                    or weekly_payload.get("cycle") != weekly["cycle"]):
+                raise ValueError("The interrupted run's weekly audit is not verified.")
+        if any(issue.get("last_assessed_run") == run_id
+               and (issue.get("status") in {"candidate", "investigate"} or issue.get("revalidation_required"))
+               for issue in state.get("issues", {}).values() if isinstance(issue, dict)):
+            raise ValueError("The interrupted run still has unresolved technical findings.")
+        valid, _, raw = check_sealed_file(root, run_id, "goal-receipt", record["report"], remaining())
+        if not valid:
+            raise ValueError("Recovery report is missing or changed.")
+        try:
+            report = json.loads(raw)
+        except (ValueError, RecursionError) as exc:
+            raise ValueError("Recovery report is malformed.") from exc
+        if (not isinstance(report, dict) or type(report.get("schema_version")) is not int
+                or report["schema_version"] != 1
+                or report.get("run_id") != run_id or report.get("followup_ids") != followup_ids
+                or report.get("run_fingerprint") != record["run_fingerprint"]
+                or not isinstance(report.get("resolution"), str) or not report["resolution"].strip()
+                or not isinstance(report.get("evidence"), list) or not report["evidence"]
+                or len(report["evidence"]) > 32 or not isinstance(report.get("blocker_issue_ids"), list)
+                or len(report["blocker_issue_ids"]) > 32
+                or (not report["blocker_issue_ids"]
+                    and (run.get("blocker_scope") != "notes" or not prior_assessment["unassessed"]))
+                or any(not isinstance(key, str) for key in report["blocker_issue_ids"])
+                or len(set(report["blocker_issue_ids"])) != len(report["blocker_issue_ids"])):
+            raise ValueError("Recovery report must bind the runs, explain the original blocker and cite evidence.")
+        def check_reference(ref: dict) -> None:
+            if (not isinstance(ref, dict) or not isinstance(ref.get("path"), str)
+                    or not isinstance(ref.get("sha256"), str)
+                    or not check_sealed_file(root, run_id, "report-snapshot", ref, remaining())[0]):
+                raise ValueError("Recovery supporting evidence is unavailable or changed.")
+        parallel_check(report["evidence"], check_reference)
+        evidence_paths = {str(Path(ref["path"]).resolve()) for ref in report["evidence"]}
+        at_finish = run.get("operational_blocker_ids", [])
+        if not isinstance(at_finish, list) or any(not isinstance(key, str) for key in at_finish):
+            raise ValueError("The original blocker snapshot is malformed.")
+        known_blockers = set(at_finish) | {key for key, issue in state.get("issues", {}).items()
+                                          if isinstance(issue, dict) and issue.get("kind") == "operational"
+                                          and issue.get("recovery_run_id") == run_id}
+        if set(report["blocker_issue_ids"]) != known_blockers:
+            raise ValueError("Recovery report must include every known original operational blocker.")
+        for issue_id in report["blocker_issue_ids"]:
+            issue = state.get("issues", {}).get(issue_id)
+            if (not isinstance(issue, dict) or issue.get("kind") != "operational"
+                    or issue.get("status") not in {"resolved", "justified"}
+                    or issue.get("recovery_run_id") != run_id
+                    or issue.get("recovery_run_fingerprint") != record["run_fingerprint"]
+                    or issue.get("revalidation_required") or not str(issue.get("resolution", "")).strip()
+                    or not isinstance(issue.get("evidence"), list) or not issue["evidence"]
+                    or any(not isinstance(item, str) or str(Path(item).resolve()) not in evidence_paths
+                           for item in issue["evidence"])):
+                raise ValueError("Each original blocker needs a resolved run-bound issue and current evidence.")
+        for key, followup in followups.items():
+            followup_report = followup.get("report")
+            if (not isinstance(followup_report, dict)
+                    or not check_sealed_file(root, key, "report-snapshot", followup_report, remaining())[0]):
+                raise ValueError("A completed follow-up report is unavailable or changed.")
+        original_report = run.get("report")
+        if (original_report is not None and (not isinstance(original_report, dict)
+                or not check_sealed_file(root, run_id, "report-snapshot", original_report, remaining())[0])):
+            raise ValueError("The original run report is unavailable or changed.")
+        raw_index = read_store_state(root, "processed.json", remaining())
+        if raw_index is None:
+            raise ValueError("Processed index is unavailable.")
+        index = json.loads(raw_index)
+        if not isinstance(index, dict) or not isinstance(index.get("processed", {}), dict):
+            raise ValueError("Processed index is malformed.")
+        entries = index.get("processed", {})
+        assessment = pipeline.initial_assessment(run, timeout=remaining(), processed=entries)
+        if not assessment["known"] or assessment["unassessed"] or assessment["unavailable"]:
+            raise ValueError("Original sources remain unassessed or unavailable.")
+        for source in prior_assessment["unassessed"]:
+            if (not isinstance(source, dict) or source.get("id") not in entries
+                    or entries[source["id"]].get("consolidation_run") not in followup_ids):
+                raise ValueError("The follow-up does not cover each previously unassessed source.")
+        for source in initial:
+            entry = entries[source["id"]]
+            if entry.get("status") != "processed" and (not isinstance(entry.get("rationale"), str)
+                                                        or not entry["rationale"].strip()):
+                raise ValueError("Original review or rejection lacks a rationale.")
+        integrated = [source for source in initial if entries[source["id"]].get("status") == "processed"]
+        groups: dict[str, list[dict]] = {}
+        for source in integrated:
+            key = json.dumps(entries[source["id"]].get("integration_receipt", {}), sort_keys=True)
+            groups.setdefault(key, []).append(source)
+        def check_integration(group: list[dict]) -> None:
+            cache: dict = {}
+            for source in group:
+                problem = integration_problem(entries[source["id"]], source["id"], cache,
+                                              timeout=min(8, remaining()), state=index)
+                if problem:
+                    raise ValueError("Original source integration is not current: " + problem)
+        parallel_check(list(groups.values()), check_integration)
+        ref = {"path": record["report"]["path"], "sha256": hashlib.sha256(raw).hexdigest()}
+        refs = [ref, *report["evidence"], *(value["report"] for value in followups.values())]
+        if original_report is not None:
+            refs.append(original_report)
+        if run.get("weekly_due"):
+            refs.append(state["weekly"]["snapshot"])
+        parallel_check(refs, check_reference)
+        if fingerprint(pipeline.initial_assessment(run, timeout=remaining(), processed=entries)) != fingerprint(assessment):
+            raise ValueError("Original source evidence changed during recovery verification; retry.")
+        parallel_check(list(groups.values()), check_integration)
+        parallel_check(refs, check_reference)
+        if fingerprint(pipeline.initial_assessment(run, timeout=remaining(), processed=entries)) != fingerprint(assessment):
+            raise ValueError("Original source evidence changed during recovery verification; retry.")
+        latest = read_store_state(root, "processed.json", remaining())
+        if latest != raw_index:
+            raise ValueError("Processed outcomes changed during recovery verification; retry.")
+        return {**record, "report": ref}
+
+    return Pipeline(root, lambda: state_update_lock(root), read_finalized, verify_sealed, verify_recovery)
 
 
 def pipeline_roots(root: Path, added: list[str] | None = None) -> list[str]:
@@ -1661,6 +2057,14 @@ def command_pipeline(args: argparse.Namespace) -> int:
     root = learning_root(config)
     ensure_store(root)
     pipeline = pipeline_store(root)
+    def pipeline_before(deadline: float) -> dict:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EvidenceUnavailable("Pipeline state timed out; retry.")
+        raw = read_store_state(root, "pipeline.json", remaining)
+        if raw is None:
+            raise EvidenceUnavailable("Pipeline state is unavailable; retry.")
+        return pipeline.load(raw)
     operation = args.command
     if operation == "pipeline-configure":
         pipeline.configure(args.ordinary_thread, args.release_thread, args.language)
@@ -1668,10 +2072,219 @@ def command_pipeline(args: argparse.Namespace) -> int:
     elif operation == "pipeline-status":
         result = pipeline.status()
     elif operation == "pipeline-begin":
-        initial_inbox, unavailable = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")))
+        initial_inbox, unavailable = bounded_note_inventory(root, sorted((root / "inbox").glob("*.md")), timeout=10)
+        if unavailable and not initial_inbox:
+            raise ConfigError("Inbox sources are present but none are readable; retry the next run after storage recovery.")
         result = pipeline.begin(args.run_id, args.runner, pipeline_inventory(root),
                                 [{"id": n["id"], "path": n["path"], "sha256": n["sha256"]}
-                                 for n in initial_inbox], unavailable)
+                                 for n in initial_inbox], unavailable, getattr(args, "goal_mode", None),
+                                getattr(args, "dispatch_evidence", None))
+    elif operation == "pipeline-dispatch-bind":
+        result = pipeline.bind_dispatch(args.run_id, args.dispatch_evidence)
+    elif operation == "pipeline-goal-attempt":
+        result = pipeline.mark_goal_attempt(args.run_id, args.goal_thread_id)
+        recorded_second = int(datetime.fromisoformat(result["recorded_at"]).timestamp())
+        deadline = time.monotonic() + 3
+        while int(time.time()) <= recorded_second:
+            if time.monotonic() >= deadline:
+                raise ConfigError("Goal attempt was saved, but the clock did not advance; reconcile before creation.")
+            time.sleep(0.05)
+    elif operation == "pipeline-goal-bind":
+        result = pipeline.bind_goal(args.run_id, args.initial_fingerprint, args.goal_thread_id, args.goal_receipt)
+    elif operation == "pipeline-goal-reopen":
+        result = pipeline.reopen_goal(args.run_id, args.initial_fingerprint, args.sealed_at, args.reason, args.goal_receipt)
+    elif operation == "pipeline-goal-advance":
+        result = pipeline.advance_goal(args.run_id, args.initial_fingerprint, args.sealed_at, args.goal_receipt)
+    elif operation == "pipeline-run-reconcile":
+        result = pipeline.reconcile_run(args.run_id, args.followup_run_id, args.report)
+    elif operation == "pipeline-goal-status":
+        with state_update_lock(root):
+            state_deadline = time.monotonic() + GOAL_SEAL_TIMEOUT_SECONDS
+            pipeline_state = pipeline_before(state_deadline)
+            pipeline.check_reconciliation_ledger(pipeline_state)
+            run = pipeline_state["runs"].get(args.run_id)
+            if not run or "initial_inbox" not in run:
+                raise ConfigError("Goal baseline run or its initial inbox is unavailable.")
+            baseline = fingerprint({"inbox": run["initial_inbox"], "unavailable": run.get("initial_unavailable", [])})
+            if baseline != args.initial_fingerprint or run.get("initial_fingerprint") != baseline:
+                raise ConfigError("Goal baseline fingerprint does not match the saved initial inbox.")
+            index = load_state(root, deadline=state_deadline)
+            state_hash = fingerprint(index)
+            pipeline_hash = fingerprint(pipeline_state)
+            reference = {"run_id": args.run_id, "initial_fingerprint": baseline}
+            if run.get("goal_baseline") != reference:
+                raise ConfigError("Goal baseline has not been bound to a pipeline cycle.")
+            scopes, unknown_runs, deadline = [], [], time.monotonic() + 3
+            cycle = pipeline_state.get("goal_cycle", {})
+            active_cycle = cycle.get("status") == "active" and all(cycle.get(k) == v for k, v in reference.items())
+            baseline_started = datetime.fromisoformat(run["started_at"])
+            for scope_id, scope in pipeline_state["runs"].items():
+                if scope.get("goal_baseline") != reference:
+                    if scope.get("goal_mode") == "manual" and not scope.get("goal_baseline"):
+                        continue
+                    if active_cycle:
+                        try:
+                            if datetime.fromisoformat(scope["started_at"]) >= baseline_started:
+                                unknown_runs.append(scope_id)
+                        except (KeyError, TypeError, ValueError):
+                            unknown_runs.append(scope_id)
+                    continue
+                try:
+                    scope_hash = fingerprint({"inbox": scope["initial_inbox"], "unavailable": scope.get("initial_unavailable", [])})
+                    if scope.get("initial_fingerprint") != scope_hash:
+                        raise ValueError("Unbound initial snapshot")
+                    status = scope["status"]
+                    if status not in {"running", "completed", "partial", "failed"}:
+                        raise ValueError("Unknown run status")
+                    if status != "running" and datetime.fromisoformat(scope["finished_at"]) < datetime.fromisoformat(scope["started_at"]):
+                        raise ValueError("Invalid run finish time")
+                except (KeyError, TypeError, ValueError):
+                    unknown_runs.append(scope_id)
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    assessed = {"known": False, "unassessed": scope["initial_inbox"],
+                                "unavailable": scope.get("initial_unavailable", [])}
+                else:
+                    assessed = pipeline.initial_assessment(scope, timeout=remaining, processed=index.get("processed", {}))
+                scopes.append({"run_id": scope_id, "started_at": scope["started_at"], "status": scope["status"], "initial_fingerprint": scope_hash,
+                               "assessment": assessed, "sources": scope["initial_inbox"]})
+            scopes.sort(key=lambda item: datetime.fromisoformat(item["started_at"]))
+        unassessed = {item["id"] for scope in scopes for item in scope["assessment"]["unassessed"]}
+        receipts, review, rejected, cache = [], [], [], {}
+        receipt_deadline = time.monotonic() + 30
+        sources = {source["id"]: source for scope in scopes for source in scope["sources"]}
+        for source in sources.values():
+            note_id = source["id"]
+            if note_id in unassessed:
+                continue
+            entry = index.get("processed", {}).get(note_id, {})
+            if entry.get("status") == "processed":
+                problem = integration_problem(entry, note_id, cache, timeout=min(8, receipt_deadline - time.monotonic()),
+                                              state=index)
+                receipts.append({"note_id": note_id, "status": "pending" if problem else "verified", "reason": problem})
+            elif entry.get("status") == "needs-review":
+                review.append({"note_id": note_id, "rationale": entry.get("rationale", "")})
+            elif entry.get("status") == "rejected":
+                rejected.append({"note_id": note_id, "rationale": entry.get("rationale", "")})
+        with state_update_lock(root):
+            state_deadline = time.monotonic() + GOAL_SEAL_TIMEOUT_SECONDS
+            if fingerprint(load_state(root, deadline=state_deadline)) != state_hash:
+                raise ConfigError("Processed state changed during Goal verification; retry the check.")
+            if fingerprint(pipeline_before(state_deadline)) != pipeline_hash:
+                raise ConfigError("Pipeline state changed during Goal verification; retry the check.")
+        for scope in scopes:
+            scope.pop("sources")
+        result = {"run_id": args.run_id, "initial_fingerprint": baseline, "runs": scopes,
+                  "unknown_runs": unknown_runs,
+                  "accounting_complete": bool(scopes) and not unknown_runs and all(
+                      scope["status"] != "running" and scope["assessment"]["known"]
+                      and not scope["assessment"]["unassessed"] and not scope["assessment"]["unavailable"]
+                      for scope in scopes),
+                  "receipts": receipts, "needs_review": review, "rejected": rejected,
+                  "notice": "This checks bound note outcomes only; it does not establish semantic approval, resolve review decisions, or certify pipeline completion."}
+        if args.seal:
+            if (not result["accounting_complete"] or any(item["status"] != "verified" for item in receipts)
+                    or any(not str(item.get("rationale", "")).strip() for item in review + rejected)):
+                raise ConfigError("Goal cycle still has unaccounted sources, running runs, or pending integration receipts.")
+            with state_update_lock(root):
+                seal_deadline = time.monotonic() + GOAL_SEAL_TIMEOUT_SECONDS
+                def seal_budget() -> float:
+                    remaining = seal_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ConfigError("Goal sealing timed out; retry the check.")
+                    return remaining
+                current_state = pipeline_before(seal_deadline)
+                if fingerprint(current_state) != pipeline_hash or fingerprint(load_state(root, deadline=seal_deadline)) != state_hash:
+                    raise ConfigError("Goal evidence changed before sealing; retry the check.")
+                cycle = current_state.get("goal_cycle", {})
+                if cycle.get("status") not in {"active", "sealed"} or any(cycle.get(k) != v for k, v in reference.items()):
+                    raise ConfigError("The requested Goal cycle is not active.")
+                if not args.goal_receipt:
+                    raise ConfigError("Sealing requires a current active native Goal receipt.")
+                goal_ref, native_goal = pipeline.goal_evidence(args.goal_receipt, reference, cycle.get("goal_thread_id", ""), "active", deadline=seal_deadline)
+                if native_goal["createdAt"] != cycle.get("goal_created_at"):
+                    raise ConfigError("Native Goal identity changed; reconcile before sealing.")
+                for scope in scopes:
+                    fresh = pipeline.initial_assessment(current_state["runs"][scope["run_id"]], timeout=seal_budget(),
+                                                        processed=index.get("processed", {}))
+                    if fingerprint(fresh) != fingerprint(scope["assessment"]):
+                        raise ConfigError("Goal source evidence changed during sealing; retry the check.")
+                if receipts:
+                    audit_command = [sys.executable, __file__, "--config", str(args.config),
+                                     "integration-audit", "--require-verified"]
+                    for item in receipts:
+                        audit_command.extend(["--note-id", item["note_id"]])
+                    try:
+                        subprocess.run(audit_command, capture_output=True, check=True, timeout=seal_budget())
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        raise ConfigError("Goal integration evidence changed or timed out during sealing; retry the check.") from exc
+                review_paths = sorted((root / "needs-review").glob("*.md"))
+                review_notes, unavailable = bounded_note_inventory(root, review_paths, timeout=seal_budget())
+                if unavailable:
+                    raise ConfigError("Review inventory is incomplete; retry before sealing the Goal.")
+                if any(note["review_decision"] not in {"pending", "ambiguous"} for note in review_notes):
+                    raise ConfigError("Explicit review decisions must be processed before sealing the Goal.")
+                policy = review_analysis(config, review_notes)
+                selected = review_notes if policy["group_review_due"] else [
+                    note for note in review_notes if note["id"] in {item["note_id"] for item in review}]
+                review_issues = {}
+                if selected:
+                    if not args.review_evidence:
+                        raise ConfigError("Goal review requires a current residual review receipt.")
+                    review_path = Path(args.review_evidence).expanduser().resolve()
+                    review_deadline = seal_deadline
+                    review_bytes = read_before_deadline(review_path, review_deadline)
+                    review_ref = {"path": str(review_path), "sha256": hashlib.sha256(review_bytes).hexdigest()}
+                    validate_residual_review(root, selected, args.review_evidence, deadline=review_deadline, content=review_bytes)
+                    decisions = {item["note_id"]: item["classification"]
+                                 for item in json.loads(review_bytes)["decisions"]
+                                 if isinstance(item, dict) and isinstance(item.get("note_id"), str)
+                                 and isinstance(item.get("classification"), str)}
+                    for note in selected:
+                        if note["review_decision"] not in {"pending", "ambiguous"}:
+                            continue
+                        linked = next((issue for _, issue in sorted(current_state.get("issues", {}).items())
+                            if isinstance(issue, dict)
+                            and issue.get("status") == decisions[note["id"]]
+                            and not issue.get("revalidation_required")
+                            and any(ref.get("note_id") == note["id"]
+                                    and isinstance(ref.get("path"), str)
+                                    and Path(ref["path"]).resolve() == Path(note["path"]).resolve()
+                                    and ref.get("sha256") == note["sha256"]
+                                    for ref in issue.get("sources", []) if isinstance(ref, dict))), None)
+                        if linked is None:
+                            raise ConfigError(f"Persist residual classification for {note['id']} as a source-linked issue before sealing.")
+                        review_issues[note["id"]] = {"id": linked["id"], "fingerprint": fingerprint(linked)}
+                    if read_before_deadline(review_path, review_deadline) != review_bytes:
+                        raise ConfigError("Goal review evidence changed during sealing; retry the check.")
+                    if cycle["status"] == "sealed" and cycle.get("review_receipt") != review_ref:
+                        raise ConfigError("Sealed Goal review evidence changed; reopen the cycle to reassess.")
+                    cycle["review_receipt"] = review_ref
+                    result["review_receipt"] = review_ref
+                latest_notes, unavailable = bounded_note_inventory(root, sorted((root / "needs-review").glob("*.md")), timeout=seal_budget())
+                if unavailable or fingerprint([(n["id"], n["path"], n["sha256"], n["review_decision"]) for n in latest_notes]) != fingerprint(
+                        [(n["id"], n["path"], n["sha256"], n["review_decision"]) for n in review_notes]):
+                    raise ConfigError("Review sources changed or became unavailable during Goal sealing; retry the check.")
+                if cycle["status"] == "active":
+                    seal_budget()
+                    outcomes = {}
+                    for note_id in sorted(sources):
+                        entry = index["processed"][note_id]
+                        outcomes[note_id] = {"entry_fingerprint": fingerprint(entry),
+                                             "archive": {"path": entry["path"], "sha256": entry["archive_sha256"]}}
+                    snapshot = {"runs_fingerprint": fingerprint({scope["run_id"]: current_state["runs"][scope["run_id"]] for scope in scopes}),
+                                "outcomes": outcomes,
+                                "reviews": {n["id"]: {"path": n["path"], "sha256": n["sha256"], "review_decision": n["review_decision"]} for n in selected},
+                                "review_binding_version": 1,
+                                "review_issues": review_issues,
+                                "review_receipt": cycle.get("review_receipt")}
+                    cycle.update(status="sealed", sealed_at=now_iso(), seal_goal_receipt=goal_ref,
+                                 review_binding_version=1, sealed_snapshot=snapshot)
+                    pipeline.save(current_state)
+                result["sealed"] = True
+                result["sealed_at"] = cycle["sealed_at"]
+                result["goal_update_required"] = True
     elif operation == "pipeline-issue":
         issue = read_json_input(args.from_json)
         for ref in issue.get("sources", []):
@@ -1684,7 +2297,7 @@ def command_pipeline(args: argparse.Namespace) -> int:
                 and issue.get("status") not in {"resolved", "justified"}
             ):
                 raise ConfigError("Explicit human decisions take precedence over pipeline classifications.")
-        result = pipeline.update_issue(issue)
+        result = pipeline.update_issue(issue, getattr(args, "run_id", None))
     elif operation == "pipeline-finish":
         if args.status == "completed":
             if (getattr(args, "require_integration", False)
@@ -1696,11 +2309,16 @@ def command_pipeline(args: argparse.Namespace) -> int:
                 if unavailable:
                     raise ConfigError("Current note inventory is incomplete; completion is not verified.")
         inventory = pipeline_inventory(root) if args.status == "completed" else None
-        result = pipeline.finish(args.run_id, args.status, args.summary, args.report, args.target or [], inventory)
+        result = pipeline.finish(args.run_id, args.status, args.summary, args.report, args.target or [], inventory,
+                                 getattr(args, "blocker_scope", None))
     elif operation == "pipeline-release-status":
-        result = pipeline.weekly_release_status()
+        result = pipeline.weekly_release_status(getattr(args, "release_version", None), Path.cwd(),
+                                                getattr(args, "release_assessment", None),
+                                                getattr(args, "release_base", "origin/main"))
         if config.get("AGENT_LEARNING_REQUIRE_INTEGRATION", "0") == "1":
             require_run_integrations(root, result["consolidation"])
+    elif operation == "pipeline-release-assessment":
+        result = release_assessment_skeleton(pipeline.status(), Path.cwd(), args.release_base)
     elif operation == "notify-ack":
         pipeline.acknowledge(args.digest_id, args.receipt, not args.not_delivered)
         result = {"acknowledged": args.digest_id, "delivered": not args.not_delivered}
@@ -1717,31 +2335,57 @@ def command_pipeline_audit(args: argparse.Namespace) -> int:
     pipeline = pipeline_store(root)
     state = pipeline.status()
     pipeline.active(state, args.run_id)
+    if (getattr(args, "reconcile_parser", False) or getattr(args, "full", False)) and args.weekly:
+        raise ConfigError("Run a forced full or parser-reconciliation audit without --weekly.")
     if args.weekly and not state["weekly_due"]:
         print(json.dumps(state["weekly"]))
         return 0
     paths = pipeline_roots(root, args.target)
     baseline = None
     previous = state["weekly"]
-    if previous and previous.get("roots") == paths:
+    run = state["runs"][args.run_id]
+    parser_version = state.get("audit_rule_parser_version")
+    if parser_version is None:
+        parser_version = 1 if previous or any(i.get("kind") == "audit" for i in state["issues"].values()) else RULE_PARSER_VERSION
+    if type(parser_version) is not int or not 1 <= parser_version <= RULE_PARSER_VERSION:
+        raise ConfigError("Pipeline audit parser version is invalid or unsupported.")
+    if getattr(args, "reconcile_parser", False):
+        migration = state["issues"].get(f"audit-parser-v{RULE_PARSER_VERSION}-reconciliation")
+        if not migration or migration.get("status") not in {"candidate", "investigate", "needs-user", "resolved", "justified"}:
+            raise ConfigError("No parser reconciliation is available to refresh.")
+        parser_version = 1
+    if not args.weekly and isinstance(run.get("initial_targets"), list):
+        baseline = pipeline.inside("reports/.pipeline-baseline-" + uuid.uuid4().hex + ".json")
+        pipeline.write(baseline, {"rule_parser_version": parser_version, "file_snapshots": [
+            {"path": ref["path"], "sha256": ref["sha256"], "words": None}
+            for ref in run["initial_targets"]]})
+    elif previous:
         ref = previous["snapshot"]
         if snapshot(ref["path"])["sha256"] != ref["sha256"]:
             raise ConfigError("Previous audit snapshot changed; preserve and reconcile it.")
         previous_payload = json.loads(Path(ref["path"]).read_text())["audit"]
+        previous_payload["rule_parser_version"] = parser_version
         # The audit helper expects its own payload, not the pipeline envelope.
         baseline = pipeline.inside("reports/.pipeline-baseline-" + uuid.uuid4().hex + ".json")
         pipeline.write(baseline, previous_payload)
+    elif parser_version != RULE_PARSER_VERSION:
+        baseline = pipeline.inside("reports/.pipeline-baseline-" + uuid.uuid4().hex + ".json")
+        pipeline.write(baseline, {"rule_parser_version": parser_version, "file_snapshots": [
+            {"path": ref["path"], "sha256": ref["sha256"], "words": None}
+            for ref in run.get("initial_targets", [])]})
     capture = io.StringIO()
     try:
         with redirect_stdout(capture):
             command_audit_rules(argparse.Namespace(path=paths, skills_dir=None, all_md=False,
                                baseline=baseline, similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD,
-                               conflict_threshold=DEFAULT_CONFLICT_THRESHOLD))
+                               conflict_threshold=DEFAULT_CONFLICT_THRESHOLD,
+                               force_full=getattr(args, "full", False),
+                               new_targets=None if args.weekly else (args.target or [])))
         payload = json.loads(capture.getvalue())
     finally:
         if baseline and baseline.exists():
             baseline.unlink()
-    result = pipeline.audit(args.run_id, payload, paths, args.weekly)
+    result = pipeline.audit(args.run_id, payload, paths, args.weekly, args.target)
     print(json.dumps(result, indent=2))
     return 0
 
@@ -1761,24 +2405,120 @@ def command_privacy_scan(args: argparse.Namespace) -> int:
 
 def iter_markdown_bullets(path: Path, text: str | None = None) -> list[dict[str, Any]]:
     bullets: list[dict[str, Any]] = []
-    in_fence = False
+    pending: dict[str, Any] | None = None
+    pending_content_indent = 0
+    list_indents: list[tuple[int, int]] = []
+    fence: tuple[str, int, int, int] | None = None
+    code_indent: int | None = None
+
+    def flush() -> None:
+        nonlocal pending
+        if pending is not None:
+            bullets.append(pending)
+            pending = None
+
     for idx, raw in enumerate((text if text is not None else path.read_text(encoding="utf-8", errors="ignore")).splitlines(), start=1):
-        line = raw.rstrip("\n")
+        line = raw.expandtabs(4)
         stripped = line.lstrip()
-        if stripped.startswith("```"):
+        indent = len(line) - len(stripped)
+        if code_indent is not None:
+            if stripped and indent < code_indent:
+                code_indent = None
+            else:
+                continue
+        fence_match = re.match(r"^(`{3,}|~{3,})(.*)$", stripped)
+        if fence:
+            if stripped and indent < fence[2]:
+                fence = None  # The enclosing list ended; process this line again.
+            elif (fence_match and fence_match.group(1)[0] == fence[0]
+                    and len(fence_match.group(1)) >= fence[1] and fence[2] <= indent <= fence[3]
+                    and not fence_match.group(2).strip()):
+                fence = None
+                continue
+            else:
+                continue
+        parents = [content for _, content in list_indents if content <= indent <= content + 3]
+        parent = max(parents) if parents else None
+        if indent >= 4 and parent is None:
+            flush()
+            list_indents.clear()
+            continue  # An indented code block is not a fenced block or list.
+        if pending is not None and indent >= pending_content_indent + 4:
+            flush()  # Indented code inside a list is not rule prose.
+            code_indent = pending_content_indent + 4
+            continue
+        valid_fence = (fence_match and (indent <= 3 or parent is not None)
+                       and not (fence_match.group(1)[0] == "`" and "`" in fence_match.group(2)))
+        if valid_fence:
+            min_indent = parent if parent is not None else 0
+            max_indent = parent + 3 if parent is not None else 3
+            flush()
+            if parent is None:
+                list_indents.clear()
+            fence = (fence_match.group(1)[0], len(fence_match.group(1)), min_indent, max_indent)
+            continue
+        other_list = re.match(r"^(\s*)([*+]|\d{1,9}[.)])(\s+)(.*)$", line)
+        if other_list:
+            flush()
+            while list_indents and list_indents[-1][0] >= indent:
+                list_indents.pop()
+            content_indent = other_list.start(4) if len(other_list.group(3)) <= 4 else indent + len(other_list.group(2)) + 1
+            list_indents.append((indent, content_indent))
+            if len(other_list.group(3)) > 4:
+                code_indent = content_indent + 4
+                continue
+            inline_fence = re.match(r"^(`{3,}|~{3,})(.*)$", other_list.group(4))
+            if inline_fence and not (inline_fence.group(1)[0] == "`" and "`" in inline_fence.group(2)):
+                fence = (inline_fence.group(1)[0], len(inline_fence.group(1)), content_indent, content_indent + 3)
+            continue
+        match = re.match(r"^(\s*)-(\s+)(.*)$", line)
+        if match:
+            flush()
+            while list_indents and list_indents[-1][0] >= indent:
+                list_indents.pop()
+            content_indent = match.start(3) if len(match.group(2)) <= 4 else indent + 2
+            list_indents.append((indent, content_indent))
+            if len(match.group(2)) > 4:
+                code_indent = content_indent + 4
+                continue
+            value = match.group(3).strip()
+            if value.startswith(("[ ]", "[x]", "[X]")) or not value:
+                continue
+            inline_fence = re.match(r"^(`{3,}|~{3,})(.*)$", value)
+            if inline_fence and not (inline_fence.group(1)[0] == "`" and "`" in inline_fence.group(2)):
+                fence = (inline_fence.group(1)[0], len(inline_fence.group(1)), content_indent, content_indent + 3)
+                continue
+            pending = {"path": str(path), "line": idx, "text": value}
+            pending_content_indent = content_indent
+            continue
+        if pending is None:
+            if stripped and indent == 0:
+                list_indents.clear()
+            continue
+        if (not stripped or indent >= pending_content_indent + 4
+                or re.match(r"^(?:#{1,6}(?:\s|$)|>|(?:[*+]|\d+[.)])\s+|(?:-{3,}|\*{3,}|_{3,})\s*$)", stripped)):
+            flush()
+            continue
+        pending["text"] += " " + stripped
+    flush()
+    return bullets
+
+
+def legacy_markdown_bullets(path: Path, text: str) -> list[dict[str, Any]]:
+    """Reconstruct version 1 discoveries only when migrating a baseline."""
+    bullets = []
+    in_fence = False
+    for idx, line in enumerate(text.splitlines(), start=1):
+        if line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
         if in_fence:
             continue
         match = re.match(r"^\s*-\s+(.*)$", line)
-        if not match:
-            continue
-        value = match.group(1).strip()
-        if value.startswith("[ ]") or value.startswith("[x]") or value.startswith("[X]"):
-            continue
-        if not value:
-            continue
-        bullets.append({"path": str(path), "line": idx, "text": value})
+        if match:
+            value = match.group(1).strip()
+            if value and not value.startswith(("[ ]", "[x]", "[X]")):
+                bullets.append({"path": str(path), "line": idx, "text": value})
     return bullets
 
 
@@ -1805,22 +2545,37 @@ def rule_polarity(text: str) -> int:
 
 def command_audit_rules(args: argparse.Namespace) -> int:
     baseline: dict[str, dict[str, Any]] | None = None
+    parser_reparse = False
     if args.baseline:
         try:
             previous = json.loads(args.baseline.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ConfigError(f"Cannot read audit baseline: {exc}") from exc
         snapshots = previous.get("file_snapshots") if isinstance(previous, dict) else None
+        previous_version = previous.get("rule_parser_version", 1) if isinstance(previous, dict) else None
+        if (type(previous_version) is not int or previous_version < 1
+                or previous_version > RULE_PARSER_VERSION):
+            raise ConfigError("Audit baseline has an unsupported rule parser version.")
+        parser_reparse = previous_version != RULE_PARSER_VERSION
         if not isinstance(snapshots, list) or any(
             not isinstance(item, dict) or not isinstance(item.get("path"), str)
-            or not isinstance(item.get("words"), int) or item["words"] < 0
+            or (item.get("words") is not None and (not isinstance(item["words"], int) or item["words"] < 0))
             or not re.fullmatch(r"[a-f0-9]{64}", str(item.get("sha256", "")))
             for item in snapshots
         ):
             raise ConfigError("Audit baseline needs valid file_snapshots with paths, hashes and word counts.")
-        baseline = {item["path"]: item for item in snapshots}
-        if len(baseline) != len(snapshots):
-            raise ConfigError("Audit baseline contains duplicate file paths.")
+        baseline = {}
+        spellings: set[str] = set()
+        for item in snapshots:
+            spelling = str(Path(item["path"]).expanduser())
+            key = str(Path(spelling).resolve())
+            previous_item = baseline.get(key)
+            if spelling in spellings or (previous_item is not None and any(
+                previous_item.get(field) != item.get(field) for field in ("sha256", "words", "lines")
+            )):
+                raise ConfigError("Audit baseline contains duplicate or conflicting file paths.")
+            spellings.add(spelling)
+            baseline.setdefault(key, item)
     paths: list[Path] = []
     if args.path:
         paths.extend(Path(p).expanduser() for p in args.path)
@@ -1841,20 +2596,45 @@ def command_audit_rules(args: argparse.Namespace) -> int:
         elif path.is_file() and path.suffix.lower() == ".md":
             markdown_files.append(path)
 
+    # Preserve the first discovered spelling while comparing actual file paths.
+    # Multiple roots can otherwise scan a symlinked file twice and produce a
+    # baseline that this command itself rejects as having duplicate paths.
+    unique_files: dict[Path, Path] = {}
+    for md_path in sorted(set(markdown_files)):
+        canonical_path = md_path.resolve(strict=True)
+        unique_files.setdefault(canonical_path, md_path)
+    markdown_files = list(unique_files.values())
+
     rules: list[dict[str, Any]] = []
+    legacy_changes: list[dict[str, Any]] = []
     file_snapshots: list[dict[str, Any]] = []
     changed_files: list[str] = []
+    unbaselined_files: list[str] = []
+    new_targets = getattr(args, "new_targets", None)
+    explicit_new = ({str(Path(path).expanduser().resolve()) for path in new_targets}
+                    if new_targets is not None else None)
     for md_path in sorted(set(markdown_files)):
         raw = md_path.read_bytes()
         text = raw.decode("utf-8", errors="ignore")
         snapshot = {"path": str(md_path), "sha256": hashlib.sha256(raw).hexdigest(),
                     "words": len(text.split()), "lines": len(text.splitlines())}
-        previous_snapshot = (baseline or {}).get(str(md_path))
-        snapshot["word_delta"] = snapshot["words"] - previous_snapshot["words"] if previous_snapshot else None
+        previous_snapshot = (baseline or {}).get(str(md_path.resolve()))
+        snapshot["word_delta"] = (snapshot["words"] - previous_snapshot["words"]
+                                  if previous_snapshot and isinstance(previous_snapshot.get("words"), int) else None)
         file_snapshots.append(snapshot)
-        if previous_snapshot is None or previous_snapshot["sha256"] != snapshot["sha256"]:
+        if baseline is not None and previous_snapshot is None and explicit_new is not None:
+            unbaselined_files.append(str(md_path))
+        if ((previous_snapshot is None and (explicit_new is None or str(md_path.resolve()) in explicit_new))
+                or (previous_snapshot is not None and previous_snapshot["sha256"] != snapshot["sha256"])):
             changed_files.append(str(md_path))
-        for bullet in iter_markdown_bullets(md_path, text):
+        parsed = iter_markdown_bullets(md_path, text)
+        if parser_reparse:
+            by_line = {item["line"]: item["text"] for item in parsed}
+            for old in legacy_markdown_bullets(md_path, text):
+                current_text = by_line.get(old["line"])
+                if current_text != old["text"]:
+                    legacy_changes.append({**old, "current_text": current_text})
+        for bullet in parsed:
             bullet["norm"] = normalize_rule(bullet["text"])
             rules.append(bullet)
 
@@ -1867,7 +2647,8 @@ def command_audit_rules(args: argparse.Namespace) -> int:
 
     exact_duplicates = [group for group in by_norm.values() if len(group) > 1]
     changed_set = set(changed_files)
-    if baseline is not None:
+    full_comparison = parser_reparse or bool(getattr(args, "force_full", False))
+    if baseline is not None and not full_comparison:
         exact_duplicates = [group for group in exact_duplicates if any(rule["path"] in changed_set for rule in group)]
 
     similarity_threshold = float(args.similarity_threshold)
@@ -1889,7 +2670,8 @@ def command_audit_rules(args: argparse.Namespace) -> int:
             continue
         for idx, left in enumerate(group):
             for right in group[idx + 1 :]:
-                if baseline is not None and left["path"] not in changed_set and right["path"] not in changed_set:
+                if (baseline is not None and not full_comparison
+                        and left["path"] not in changed_set and right["path"] not in changed_set):
                     continue
                 key = (left["path"], left["line"], right["path"], right["line"])
                 if key in seen_pairs:
@@ -1907,12 +2689,17 @@ def command_audit_rules(args: argparse.Namespace) -> int:
                         potential_conflicts.append({"ratio": ratio, "a": left, "b": right})
 
     payload = {
+        "rule_parser_version": RULE_PARSER_VERSION,
         "scanned_files": [str(path) for path in sorted(set(markdown_files))],
         "rule_count": len(rules),
         "file_snapshots": file_snapshots,
         "changed_files": changed_files,
-        "removed_files": sorted(set(baseline or {}) - {str(path) for path in markdown_files}),
-        "comparison_scope": "changed-targets" if baseline is not None else "full",
+        "unbaselined_files": unbaselined_files,
+        "removed_files": sorted(item["path"] for key, item in (baseline or {}).items()
+                                if key not in {str(path.resolve()) for path in markdown_files}),
+        "comparison_scope": "changed-targets" if baseline is not None and not full_comparison else "full",
+        "parser_reparse": parser_reparse,
+        "legacy_parse_changes": legacy_changes,
         "semantic_approval": False,
         "check_effectiveness": "not-evaluated",
         "exact_duplicates": exact_duplicates,
@@ -2083,7 +2870,36 @@ def integration_entries(root: Path, state: dict, note_ids: list[str]) -> list[di
     return entries
 
 
-def integration_problem(entry: dict, note_id: str, cache: dict | None = None) -> str:
+def inspect_receipt_bounded(reference: dict, *, timeout: float) -> dict:
+    """Distinguish I/O unavailability from an independently invalid receipt."""
+    worker = '''import json,sys
+from pathlib import Path
+from learning_integration import validate_receipt
+ref=json.load(sys.stdin)
+try:
+    Path(ref.get("path", "")).stat()
+    result=validate_receipt(ref)
+    out={"status":"verified", "note_ids":result["manifest"]["note_ids"]}
+except OSError as exc:
+    out={"status":"unavailable", "reason":type(exc).__name__}
+except (ValueError,KeyError,TypeError) as exc:
+    out={"status":"invalid", "reason":str(exc)}
+print(json.dumps(out))'''
+    if timeout <= 0:
+        return {"status": "unavailable", "reason": "Verification budget exhausted."}
+    try:
+        result = subprocess.run([sys.executable, "-c", worker], cwd=str(Path(__file__).resolve().parent),
+                                input=json.dumps(reference), text=True, capture_output=True, check=True, timeout=timeout)
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict) or value.get("status") not in {"verified", "unavailable", "invalid"}:
+            raise ValueError("Invalid receipt verifier response.")
+        return value
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {"status": "unavailable", "reason": "Receipt verifier unavailable or timed out."}
+
+
+def integration_problem(entry: dict, note_id: str, cache: dict | None = None, *, timeout: float = 8,
+                        state: dict | None = None) -> str:
     if entry.get("integration_status") != "verified":
         return "No verified integration receipt; processed is archival status only."
     key = ""
@@ -2095,11 +2911,57 @@ def integration_problem(entry: dict, note_id: str, cache: dict | None = None) ->
             if isinstance(receipt, str):
                 return receipt
         else:
-            receipt = validate_receipt(reference)
+            if timeout <= 0:
+                raise ValueError("Integration verification budget exhausted before this receipt was checked; retry.")
+            worker = ("import json,sys; from pathlib import Path; from learning_integration import validate_receipt; "
+                      "r=validate_receipt(json.load(sys.stdin)); v=r['verified']; "
+                      "covered=set(v['files'])|set(v['generated']); "
+                      "[covered.update(str(Path(root)/name) for name in payload) "
+                      "for root,payload in v['skills'].items()]; "
+                      "print(json.dumps({'manifest': {'note_ids': r['manifest']['note_ids'], "
+                      "'relocations': r['manifest'].get('relocations',[])}, "
+                      "'coverage': sorted(covered), 'relocations': v.get('relocations',{})}))")
+            try:
+                result = subprocess.run([sys.executable, "-c", worker], cwd=str(Path(__file__).resolve().parent),
+                                        input=json.dumps(reference), text=True, capture_output=True,
+                                        check=True, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError("Integration verification timed out; retry when storage is available.") from exc
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or "").strip().splitlines()
+                raise ValueError(detail[-1][:500] if detail else "Integration verification failed.") from exc
+            receipt = json.loads(result.stdout)
             if cache is not None:
                 cache[key] = receipt
         if note_id not in receipt["manifest"]["note_ids"]:
             return "Integration receipt does not cover this note."
+        relocated = receipt.get("relocations", {}).get(note_id, {})
+        semantic_group = any(item.get("schema_version") == 2
+                             for item in receipt["manifest"].get("relocations", []))
+        if relocated or semantic_group:
+            recorded = {str(target) for raw in entry.get("prevention_targets", []) + entry.get("detection_targets", [])
+                        if (target := concrete_routing_target_path(raw)) is not None}
+            covered = set(receipt.get("coverage", []))
+            if (not set(relocated).issubset(recorded)
+                    or any(path not in covered and relocated.get(path) not in covered for path in recorded)):
+                return "Relocation no longer covers the note's recorded routing targets."
+            for item in receipt["manifest"].get("relocations", []):
+                if item.get("note_id") == note_id and (
+                        Path(item["note"]["path"]).resolve() != Path(entry.get("path", "")).resolve()
+                        or item["note"]["sha256"] != entry.get("archive_sha256")):
+                    return "Relocation no longer matches the archived note binding."
+                if item.get("schema_version") == 2:
+                    if not isinstance(state, dict):
+                        return "Semantic successor needs the current note group state."
+                    for impact in item["note_impacts"]:
+                        current = state.get("processed", {}).get(impact["note_id"], {})
+                        if (current.get("status") != "processed" or current.get("integration_status") != "verified"
+                                or current.get("integration_receipt") != entry.get("integration_receipt")
+                                or Path(current.get("path", "")).resolve() != Path(impact["note"]["path"]).resolve()
+                                or current.get("archive_sha256") != impact["note"]["sha256"]
+                                or current.get("prevention_targets", []) != impact["prevention_targets"]
+                                or current.get("detection_targets", []) != impact["detection_targets"]):
+                            return "Semantic successor note group state changed."
     except (ValueError, OSError, KeyError, TypeError) as exc:
         if cache is not None and key:
             cache[key] = str(exc)
@@ -2107,57 +2969,378 @@ def integration_problem(entry: dict, note_id: str, cache: dict | None = None) ->
     return ""
 
 
-def require_run_integrations(root: Path, run: dict) -> None:
-    start = datetime.fromisoformat(run["started_at"]).replace(microsecond=0)
-    end = datetime.fromisoformat(run["finished_at"]) if run.get("finished_at") else None
-    failures, cache = [], {}
-    for note_id, entry in load_state(root).get("processed", {}).items():
+def verify_manifest_bounded(manifest: dict, *, proposal: bool = False, audit: bool = False,
+                            timeout: float = 30) -> dict:
+    """Bound verification of files and consumers that may reside on slow storage."""
+    worker = ("import json,sys,time; from learning_integration import verify,verify_distribution; "
+              "from learning_coherence import verify_coherence; m=json.load(sys.stdin); "
+              "deadline=time.monotonic()+float(sys.argv[2]); "
+              "audit=sys.argv[3]=='audit'; "
+              "d=verify_distribution(m,deadline=deadline,allow_audit=audit) if audit or sys.argv[1]=='proposal' else None; "
+              "r=verify_coherence(m,d,require_reviews=False) if sys.argv[1]=='proposal' "
+              "else ({**d,'coherence':verify_coherence(m,d)} if audit else verify(m,deadline=deadline)); "
+              "print(json.dumps(r))")
+    try:
+        result = subprocess.run([sys.executable, "-c", worker, "proposal" if proposal else "verify", str(timeout),
+                                 "audit" if audit else "notes"],
+                                cwd=str(Path(__file__).resolve().parent), input=json.dumps(manifest),
+                                text=True, capture_output=True, check=True, timeout=timeout)
+        return json.loads(result.stdout)
+    except subprocess.TimeoutExpired as exc:
+        raise ConfigError("Integration verification timed out; retry when storage is available.") from exc
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or "").strip().splitlines()
+        raise ConfigError(details[-1][:500] if details else "Integration verification failed.") from exc
+    except OSError as exc:
+        raise ConfigError("Unable to start integration verification; retry.") from exc
+
+
+def run_processed_entries(state: dict, run: dict) -> list[tuple[str, dict]]:
+    initial = run.get("initial_inbox")
+    if run.get("integration_scope_version") != 1 or not isinstance(initial, list) or not run.get("id"):
+        raise ConfigError("Legacy run lacks exact integration attribution; audit explicit note IDs or all history.")
+    ids = {item["id"] for item in initial}
+    selected = []
+    for note_id, entry in state.get("processed", {}).items():
+        memberships = entry.get("consolidation_runs", [])
+        if not isinstance(memberships, list) or any(not isinstance(value, str) for value in memberships):
+            raise ConfigError("Stored consolidation membership is invalid; reconcile before auditing.")
+        belongs = entry.get("consolidation_run") == run["id"]
+        if run["id"] in memberships and (not belongs or entry.get("status") != "processed"):
+            raise ConfigError("A prior run outcome was superseded; reconcile its original evidence before auditing.")
         if entry.get("status") != "processed":
             continue
-        when = datetime.fromisoformat(entry.get("processed_at", "1970-01-01T00:00:00+00:00"))
-        if when >= start and (end is None or when <= end):
-            problem = integration_problem(entry, note_id, cache)
-            if problem:
-                failures.append(f"{note_id}: {problem}")
+        if note_id in ids and not belongs:
+            raise ConfigError("Initial source outcome lacks exact run attribution; reconcile before auditing.")
+        if belongs:
+            selected.append((note_id, entry))
+    return selected
+
+
+def require_run_integrations(root: Path, run: dict) -> None:
+    failures, cache = [], {}
+    deadline = time.monotonic() + 30
+    state = load_state(root)
+    for note_id, entry in run_processed_entries(state, run):
+        problem = integration_problem(entry, note_id, cache, timeout=min(8, deadline - time.monotonic()), state=state)
+        if problem:
+            failures.append(f"{note_id}: {problem}")
     if failures:
         raise ConfigError("Integration is incomplete: " + "; ".join(failures))
 
 
+def chained_relocation_matches(item: dict, receipt: dict, *, deadline: float | None = None,
+                               review_cache: dict[int, list[tuple[str, str, str]]] | None = None) -> bool:
+    """Match a successor to the exact relocation recorded in the current receipt."""
+    from learning_coherence import proposal_hash
+
+    if type(item.get("schema_version")) is not int or item["schema_version"] != 2:
+        return False
+    core = {"note_id", "source", "target", "source_root", "target_root", "source_head", "target_head",
+            "common_dir", "note", "snapshot", "prior_receipt"}
+    manifest, verified = receipt["manifest"], receipt["verified"]
+    if (manifest.get("version") != 1 or not isinstance(receipt.get("verified_at"), str)
+            or item["note_id"] not in manifest["note_ids"]):
+        return False
+    if review_cache is None or id(receipt) not in review_cache:
+        artifacts = {key: verified[key] for key in ("files", "skills", "generated")}
+        if "relocations" in verified:
+            artifacts["relocations"] = verified["relocations"]
+        proposal = verified["coherence"]["proposal_sha256"]
+        coherence = manifest["coherence"]
+        reviews = coherence["reviews"]
+        if (not isinstance(reviews, list) or not reviews
+                or any(not isinstance(review, dict) or review.get("verdict") != "pass"
+                       or review.get("proposal_sha256") != proposal for review in reviews)
+                or proposal_hash(manifest, artifacts) != proposal):
+            return False
+        level = coherence.get("level")
+        expected_roles = {"policy", "ergonomics"} if level == "council" else {"reviewer"}
+        if (level not in {"local", "peer", "council"} or len(reviews) != len(expected_roles)
+                or not isinstance(coherence.get("editor"), str) or not coherence["editor"].strip()
+                or coherence["editor"] != coherence["editor"].strip()):
+            return False
+        roles, reviewers, checked_reports = set(), set(), []
+        for review in reviews:
+            role, reviewer, ref = review.get("role"), review.get("reviewer"), review.get("evidence")
+            if (role not in expected_roles or role in roles or not isinstance(reviewer, str) or not reviewer.strip()
+                    or reviewer != reviewer.strip()
+                    or (level != "local" and (reviewer == coherence.get("editor") or reviewer in reviewers))
+                    or not isinstance(ref, dict) or not isinstance(ref.get("path"), str)
+                    or not Path(ref["path"]).is_absolute() or not isinstance(ref.get("sha256"), str)):
+                return False
+            evidence = read_before_deadline(Path(ref["path"]), deadline, max_bytes=16 * 1024 * 1024)
+            if hashlib.sha256(evidence).hexdigest() != ref["sha256"] or proposal.encode() not in evidence:
+                return False
+            checked_reports.append((ref["path"], ref["sha256"], proposal))
+            roles.add(role)
+            reviewers.add(reviewer)
+        if roles != expected_roles:
+            return False
+        if review_cache is not None:
+            review_cache[id(receipt)] = checked_reports
+    matches = [old for old in manifest.get("relocations", [])
+               if isinstance(old, dict) and all(old.get(key) == item.get(key) for key in core)]
+    if len(matches) != 1:
+        return False
+    previous = matches[0]
+    if set(previous) == core:
+        previous_hash = previous["snapshot"]["sha256"]
+    elif (set(previous) == core | {"schema_version", "relation", "target_sha256", "note_impacts"}
+          and type(previous["schema_version"]) is int and previous["schema_version"] == 2
+          and previous["relation"] == "semantic-successor"):
+        previous_hash = previous["target_sha256"]
+    else:
+        return False
+    return verified["files"].get(str(Path(item["target"]).resolve())) == previous_hash
+
+
+def validate_relocation_bindings(root: Path, manifest: dict, state: dict, *,
+                                 deadline: float | None = None) -> None:
+    """Bind historical mappings to the actual archived notes and recorded receipts."""
+    mappings = manifest.get("relocations", [])
+    if not mappings:
+        return
+    if not isinstance(mappings, list):
+        raise ConfigError("Relocations must be a list.")
+    if deadline is None:
+        deadline = time.monotonic() + 8
+    receipt_cache: dict[tuple[str, str], dict] = {}
+    chain_review_cache: dict[int, list[tuple[str, str, str]]] = {}
+    entries = dict(zip(manifest.get("note_ids", []), integration_entries(root, state, manifest.get("note_ids", []))))
+    receipt_dir = store_directory(root, root / "reports" / "integrations").resolve()
+    for item in mappings:
+        if not isinstance(item, dict) or item.get("schema_version") != 2:
+            continue
+        if not isinstance(item.get("source"), str) or not isinstance(item.get("note_impacts"), list):
+            raise ConfigError("Semantic successor needs complete source and note evidence.")
+        source = str(Path(item["source"]).resolve())
+        for impact in item["note_impacts"]:
+            if not isinstance(impact, dict) or not isinstance(impact.get("note_id"), str):
+                raise ConfigError("Semantic successor note evidence is invalid.")
+            paths = impact.get("prevention_targets"), impact.get("detection_targets")
+            if any(not isinstance(values, list) or any(not isinstance(value, str) for value in values)
+                   for values in paths):
+                raise ConfigError("Semantic successor routing evidence is invalid.")
+            routed = {str(path) for value in paths[0] + paths[1]
+                      if (path := concrete_routing_target_path(value)) is not None}
+            if source in routed and not any(
+                    isinstance(other, dict) and other.get("schema_version") == 2
+                    and other.get("note_id") == impact["note_id"]
+                    and other.get("source") == item["source"] and other.get("target") == item.get("target")
+                    and other.get("prior_receipt") == item.get("prior_receipt") for other in mappings):
+                raise ConfigError("Semantic successor needs a mapping for every note sharing the source.")
+    for item in mappings:
+        if not isinstance(item, dict) or not isinstance(item.get("note_id"), str) or item["note_id"] not in entries:
+            raise ConfigError("Relocation must identify an archived note.")
+        entry = entries[item["note_id"]]
+        if item.get("schema_version") == 2:
+            impacts = item.get("note_impacts")
+            if not isinstance(impacts, list) or not impacts or len(impacts) > 128:
+                raise ConfigError("Semantic successor needs the complete historical note group.")
+            for impact in impacts:
+                if (not isinstance(impact, dict) or not isinstance(impact.get("note_id"), str)
+                        or not isinstance(impact.get("note"), dict)):
+                    raise ConfigError("Semantic successor note evidence is invalid.")
+                group_entry = state.get("processed", {}).get(impact.get("note_id"), {})
+                if (group_entry.get("status") != "processed" or group_entry.get("integration_status") != "verified"
+                        or group_entry.get("integration_receipt") not in (item.get("prior_receipt"), entry.get("integration_receipt"))
+                        or not isinstance(group_entry.get("path"), str)
+                        or not isinstance(impact["note"].get("path"), str)
+                        or Path(group_entry["path"]).resolve() != Path(impact["note"]["path"]).resolve()
+                        or group_entry.get("archive_sha256") != impact["note"].get("sha256")
+                        or group_entry.get("prevention_targets", []) != impact.get("prevention_targets")
+                        or group_entry.get("detection_targets", []) != impact.get("detection_targets")):
+                    raise ConfigError("Semantic successor note group state changed.")
+        prior, note = item.get("prior_receipt"), item.get("note")
+        if (not isinstance(prior, dict) or not isinstance(prior.get("path"), str)
+                or Path(prior["path"]).expanduser().resolve().parent != receipt_dir
+                or not isinstance(note, dict) or not isinstance(note.get("path"), str)
+                or Path(note["path"]).expanduser().resolve() != Path(entry["path"]).resolve()
+                or note.get("sha256") != entry.get("archive_sha256")):
+            raise ConfigError("Relocation must bind the archived note and its receipt store.")
+        targets = {str(target) for raw in entry.get("prevention_targets", []) + entry.get("detection_targets", [])
+                   if (target := concrete_routing_target_path(raw)) is not None}
+        if not isinstance(item.get("source"), str) or str(Path(item["source"]).resolve()) not in targets:
+            raise ConfigError("Relocation must refer to a recorded concrete target.")
+        current = entry.get("integration_receipt")
+        if (entry.get("integration_status") != "verified" or not isinstance(current, dict)
+                or not isinstance(current.get("path"), str)
+                or Path(current["path"]).expanduser().resolve().parent != receipt_dir):
+            raise ConfigError("Relocation needs the note's recorded integration receipt.")
+        if current == prior:
+            continue
+        try:
+            key = (current["path"], current["sha256"])
+            if key not in receipt_cache:
+                raw = read_before_deadline(Path(current["path"]), deadline, max_bytes=16 * 1024 * 1024)
+                if hashlib.sha256(raw).hexdigest() != current["sha256"]:
+                    raise ValueError("Current receipt changed.")
+                receipt_cache[key] = json.loads(raw)
+            receipt = receipt_cache[key]
+            if (item["note_id"] not in receipt["manifest"]["note_ids"]
+                    or (item not in receipt["manifest"].get("relocations", [])
+                        and not chained_relocation_matches(item, receipt, deadline=deadline,
+                                                           review_cache=chain_review_cache))):
+                raise ValueError("Current receipt does not contain this mapping.")
+        except (TypeError, KeyError, OSError, ValueError) as exc:
+            raise ConfigError("Relocation must preserve the note's prior integration receipt.") from exc
+    for path, expected, proposal in {item for refs in chain_review_cache.values() for item in refs}:
+        evidence = read_before_deadline(Path(path), deadline, max_bytes=16 * 1024 * 1024)
+        if hashlib.sha256(evidence).hexdigest() != expected or proposal.encode() not in evidence:
+            raise ConfigError("Intermediate relocation review evidence changed during validation.")
+
+
+def audit_coherence_basis(issue: dict) -> str:
+    """Bind a review to audit discovery, targets and its current decision state."""
+    return fingerprint({key: issue.get(key) for key in
+                        ("id", "kind", "status", "title", "description", "targets", "latest_audit",
+                         "member_hash", "excluded_member_ids")})
+
+
+def audit_coherence_bindings(root: Path, manifest: dict) -> dict[str, str]:
+    """Match every reviewed preimage to the exact currently recorded audit finding."""
+    sources = manifest.get("audit_sources")
+    if (manifest.get("note_ids") != [] or not isinstance(sources, list) or not sources
+            or len(sources) > 100 or manifest.get("relocations")):
+        raise ConfigError("Audit coherence needs audit sources, no note IDs and no note relocations.")
+    pipeline = pipeline_store(root)
+    state = pipeline.status()
+    expected = {}
+    for source in sources:
+        if (not isinstance(source, dict) or set(source) != {"id", "fingerprint", "report"}
+                or not isinstance(source.get("report"), dict)
+                or set(source["report"]) != {"path", "sha256"}):
+            raise ConfigError("Audit sources need an issue ID, discovery fingerprint and registered report.")
+        issue_id = source["id"]
+        if not isinstance(issue_id, str) or not issue_id:
+            raise ConfigError("Audit source issue ID must be a nonempty string.")
+        issue = state["issues"].get(issue_id)
+        if (issue_id in expected or not isinstance(issue, dict)
+                or issue.get("kind") != "audit" or not issue_id.startswith("audit-")
+                or issue.get("status") not in {"candidate", "investigate"}
+                or issue.get("revalidation_required") or issue.get("coverage_incomplete")
+                or source["fingerprint"] != audit_coherence_basis(issue)):
+            raise ConfigError("Audit issue is missing, duplicated or changed; refresh the proposal.")
+        targets = issue.get("targets")
+        if not isinstance(targets, list) or not targets:
+            raise ConfigError("Audit issue needs recorded targets.")
+        expected[issue_id] = issue
+    coherence = manifest.get("coherence")
+    targets = coherence.get("targets") if isinstance(coherence, dict) else None
+    if not isinstance(targets, list) or not targets:
+        raise ConfigError("Audit coherence needs explicit target preimages.")
+    actual_targets = {}
+    for item in targets:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise ConfigError("Audit coherence needs explicit target preimages.")
+        path = str(Path(item["path"]).expanduser().resolve())
+        before = item.get("before")
+        if path in actual_targets or not isinstance(before, dict) or not isinstance(before.get("sha256"), str):
+            raise ConfigError("Audit coherence target preimages are incomplete or duplicated.")
+        actual_targets[path] = before
+    discovered = {}
+    for issue in expected.values():
+        for ref in issue["targets"]:
+            if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not isinstance(ref.get("sha256"), str):
+                raise ConfigError("Audit issue targets are malformed.")
+            path = str(Path(ref["path"]).expanduser().resolve())
+            if path in discovered and discovered[path] != ref["sha256"]:
+                raise ConfigError("Audit issues disagree on a target preimage.")
+            discovered[path] = ref["sha256"]
+    if discovered != {path: ref["sha256"] for path, ref in actual_targets.items()}:
+        raise ConfigError("Audit coherence must cover every exact discovery target and preimage.")
+    if not current_audit_sources(root, sources, state, actual_targets):
+        raise ConfigError("Audit discovery report or cohort evidence is missing, unregistered, changed or incomplete.")
+    return {key: audit_coherence_basis(issue) for key, issue in expected.items()}
+
+
 def command_integration(args: argparse.Namespace) -> int:
     root = learning_root(load_config(args.config))
+    if args.command == "audit-coherence-source":
+        state = pipeline_store(root).status()
+        issue = state["issues"].get(args.issue_id)
+        if (not isinstance(issue, dict) or issue.get("kind") != "audit"
+                or issue.get("status") not in {"candidate", "investigate"}
+                or issue.get("revalidation_required") or issue.get("coverage_incomplete")
+                or not issue.get("targets")
+                or not args.issue_id.startswith("audit-")):
+            raise ConfigError("Audit issue is missing or is not an audit discovery.")
+        path = Path(args.audit_report).expanduser()
+        valid, _, digest = check_sealed_file(root, "audit-source", "report-snapshot",
+                                             {"path": str(path), "sha256": None}, 8)
+        if not valid:
+            raise ConfigError("Audit report is missing or outside the learning store.")
+        source = {"id": args.issue_id, "fingerprint": audit_coherence_basis(issue),
+                  "report": {"path": str(path.resolve()), "sha256": digest}}
+        preimages = {str(Path(ref["path"]).expanduser().resolve()): ref for ref in issue["targets"]}
+        if not current_audit_sources(root, [source], state, preimages):
+            raise ConfigError("Audit discovery report is missing, unregistered, changed or does not contain the finding.")
+        if not current_refs(issue["targets"]):
+            raise ConfigError("Audit targets changed or are unavailable; reassess before review.")
+        fresh = pipeline_store(root).status()
+        if (fresh["issues"].get(args.issue_id) != issue
+                or not current_audit_sources(root, [source], fresh, preimages)):
+            raise ConfigError("Audit evidence changed while capturing its source; retry.")
+        print(json.dumps(source, indent=2))
+        return 0
+    if args.command in {"audit-coherence-proposal", "audit-coherence-check"}:
+        manifest = json.loads(read_before_deadline(Path(args.manifest), time.monotonic() + 8, max_bytes=16 * 1024 * 1024))
+        binding = audit_coherence_bindings(root, manifest)
+        proposal = args.command == "audit-coherence-proposal"
+        result = verify_manifest_bounded(manifest, proposal=proposal, audit=True)
+        if audit_coherence_bindings(root, manifest) != binding:
+            raise ConfigError("Audit evidence changed during coherence verification; retry.")
+        print(json.dumps({"status": "awaiting-review" if proposal else "verified",
+                          "audit_sources": binding, "result": result}, indent=2))
+        return 0
     if args.command == "coherence-proposal":
-        manifest = json.loads(Path(args.manifest).read_text())
-        result = verify_coherence(manifest, verify_distribution(manifest), require_reviews=False)
+        manifest = json.loads(read_before_deadline(Path(args.manifest), time.monotonic() + 8, max_bytes=16 * 1024 * 1024))
+        validate_relocation_bindings(root, manifest, load_state(root))
+        result = verify_manifest_bounded(manifest, proposal=True)
         print(json.dumps({"status": "awaiting-review", **result}, indent=2))
         return 0
     if args.command == "integration-check":
-        manifest = json.loads(Path(args.manifest).read_text())
-        result = verify_integration(manifest)
+        manifest = json.loads(read_before_deadline(Path(args.manifest), time.monotonic() + 8, max_bytes=16 * 1024 * 1024))
+        validate_relocation_bindings(root, manifest, load_state(root))
+        result = verify_manifest_bounded(manifest)
         print(json.dumps({"status": "verified", "verified": result}, indent=2))
         return 0
     if args.command == "integration-record":
-        manifest = json.loads(Path(args.manifest).read_text())
-        verified = verify_integration(manifest)
+        manifest = json.loads(read_before_deadline(Path(args.manifest), time.monotonic() + 8, max_bytes=16 * 1024 * 1024))
+        validate_relocation_bindings(root, manifest, load_state(root))
+        verified = verify_manifest_bounded(manifest)
         with state_update_lock(root):
-            state = load_state(root)
+            deadline = time.monotonic() + 6
+            state = load_state(root, deadline=deadline)
+            validate_relocation_bindings(root, manifest, state, deadline=deadline)
             entries = integration_entries(root, state, manifest["note_ids"])
             covered_files = set(verified["files"]) | set(verified["generated"])
             for skill_root, payload in verified["skills"].items():
                 covered_files.update(str(Path(skill_root) / name) for name in payload)
-            for entry in entries:
+            for note_id, entry in zip(manifest["note_ids"], entries):
+                relocated = verified.get("relocations", {}).get(note_id, {})
+                recorded = {str(target) for raw in entry.get("prevention_targets", []) + entry.get("detection_targets", [])
+                            if (target := concrete_routing_target_path(raw)) is not None}
+                if not set(relocated).issubset(recorded):
+                    raise ConfigError("Relocation must refer to a recorded concrete target.")
                 for raw in entry.get("prevention_targets", []) + entry.get("detection_targets", []):
                     target = concrete_routing_target_path(raw)
-                    if target is not None and str(target) not in covered_files:
+                    if (target is not None and str(target) not in covered_files
+                            and relocated.get(str(target)) not in covered_files):
                         raise ConfigError(f"Integration omitted a recorded concrete target: {raw}")
             if any(e.get("template_upstream_status") in {"draft-created", "deferred"} for e in entries):
                 if manifest.get("template_status") != "promoted":
                     raise ConfigError("Resolve the template handoff before recording complete integration.")
-            if verify_integration(manifest) != verified:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConfigError("Integration verification timed out; retry when storage is available.")
+            if verify_manifest_bounded(manifest, timeout=remaining) != verified:
                 raise ConfigError("Integration targets changed while preparing the receipt.")
             receipt = {"manifest": manifest, "verified": verified, "verified_at": now_iso()}
             receipt_path = store_directory(root, root / "reports" / "integrations") / f"{uuid.uuid4().hex}.json"
             atomic_write_text(receipt_path, json.dumps(receipt, indent=2) + "\n")
-            reference = {"path": str(receipt_path), "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest()}
+            reference = {"path": str(receipt_path), "sha256": hashlib.sha256(read_before_deadline(receipt_path, deadline)).hexdigest()}
             for entry in entries:
                 entry.update(integration_status="verified", integration_receipt=reference)
                 if (manifest.get("template_status") == "promoted"
@@ -2166,17 +3349,37 @@ def command_integration(args: argparse.Namespace) -> int:
             save_state(root, state)
         print(json.dumps({"status": "verified", "receipt": reference, "note_ids": manifest["note_ids"]}, indent=2))
         return 0
-    state = load_state(root)
     requested = set(args.note_id or [])
+    if sum(bool(value) for value in (args.run_id, requested, args.all_history)) > 1:
+        raise ConfigError("Choose one of --run-id, --note-id or --all-history for an integration audit.")
+    run_id = args.run_id
+    if args.require_verified and not (run_id or requested or args.all_history):
+        active = [run for run in pipeline_store(root).load()["runs"].values()
+                  if run.get("status") == "running"]
+        if len(active) > 1:
+            raise ConfigError("Multiple active runs need reconciliation before an implicit audit.")
+        if active:
+            run_id = active[0]["id"]
+        else:
+            raise ConfigError("Start a pipeline run or explicitly select --run-id, --note-id or --all-history for a strict audit.")
+    state = load_state(root)
+    entries = list(state.get("processed", {}).items())
+    if run_id:
+        run = pipeline_store(root).load()["runs"].get(run_id)
+        if not run:
+            raise ConfigError("Unknown pipeline run for integration audit.")
+        entries = run_processed_entries(state, run)
     rows, cache = [], {}
-    for note_id, entry in state.get("processed", {}).items():
+    deadline = time.monotonic() + 30
+    for note_id, entry in entries:
         if entry.get("status") != "processed" or (requested and note_id not in requested):
             continue
-        problem = integration_problem(entry, note_id, cache)
+        problem = integration_problem(entry, note_id, cache, timeout=min(8, deadline - time.monotonic()), state=state)
         rows.append({"note_id": note_id, "status": "pending" if problem else "verified", "reason": problem})
     found = {row["note_id"] for row in rows}
     rows.extend({"note_id": key, "status": "pending", "reason": "Unknown or unprocessed note."} for key in requested - found)
-    print(json.dumps({"notes": rows, "verified": sum(r["status"] == "verified" for r in rows),
+    scope = {"kind": "run", "run_id": run_id} if run_id else {"kind": "notes" if requested else "history"}
+    print(json.dumps({"scope": scope, "notes": rows, "verified": sum(r["status"] == "verified" for r in rows),
                       "pending": sum(r["status"] != "verified" for r in rows)}, indent=2))
     return 1 if args.require_verified and any(r["status"] != "verified" for r in rows) else 0
 
@@ -2186,11 +3389,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("coherence-proposal", "integration-check", "integration-record", "integration-audit"):
+    for name in ("coherence-proposal", "audit-coherence-source", "audit-coherence-proposal", "audit-coherence-check",
+                 "integration-check", "integration-record", "integration-audit"):
         integration = sub.add_parser(name)
         if name == "integration-audit":
+            integration.add_argument("--run-id", help="Audit processed notes from this pipeline run only")
             integration.add_argument("--note-id", action="append")
+            integration.add_argument("--all-history", action="store_true", help="Explicitly audit all historical notes, including during an active run")
             integration.add_argument("--require-verified", action="store_true")
+        elif name == "audit-coherence-source":
+            integration.add_argument("--issue-id", required=True)
+            integration.add_argument("--audit-report", required=True)
         else:
             integration.add_argument("--manifest", required=True)
         integration.set_defaults(func=command_integration)
@@ -2275,22 +3484,79 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--language", choices=["en", "it"], default="en")
     configure.set_defaults(func=command_pipeline)
     sub.add_parser("pipeline-status").set_defaults(func=command_pipeline)
-    sub.add_parser("pipeline-release-status").set_defaults(func=command_pipeline)
+    recovery = sub.add_parser("pipeline-run-reconcile", help="Verify recovery without rewriting the original run")
+    recovery.add_argument("--run-id", required=True)
+    recovery.add_argument("--followup-run-id", action="append", required=True)
+    recovery.add_argument("--report", required=True)
+    recovery.set_defaults(func=command_pipeline)
+    release_status = sub.add_parser("pipeline-release-status")
+    release_status.add_argument("--release-version", help="Exact candidate version for open post-release checks")
+    release_status.add_argument("--release-assessment", help="Complete candidate-bound semantic issue assessment JSON")
+    release_status.add_argument("--release-base", default="origin/main", help="Target ref bound by a scoped release assessment")
+    release_status.set_defaults(func=command_pipeline)
+    release_assessment = sub.add_parser("pipeline-release-assessment",
+                                       help="Print a private candidate-bound assessment template for every open issue/cohort")
+    release_assessment.add_argument("--release-base", default="origin/main")
+    release_assessment.set_defaults(func=command_pipeline)
     begin = sub.add_parser("pipeline-begin")
     begin.add_argument("--run-id", required=True)
     begin.add_argument("--runner", required=True, choices=["midnight", "noon"])
+    begin.add_argument("--goal-mode", required=True, choices=["scheduled", "manual"],
+                       help="Record Goal intent before the run; existing legacy runs retain unknown provenance")
+    begin.add_argument("--dispatch-evidence", help="Saved current app heartbeat capture; absent or invalid leaves scheduled runner unknown")
     begin.set_defaults(func=command_pipeline)
+    dispatch_bind = sub.add_parser("pipeline-dispatch-bind", help="Correlate this run's start with a current app heartbeat")
+    dispatch_bind.add_argument("--run-id", required=True)
+    dispatch_bind.add_argument("--dispatch-evidence", required=True)
+    dispatch_bind.set_defaults(func=command_pipeline)
+    goal_attempt = sub.add_parser("pipeline-goal-attempt", help="Record possible Goal creation before calling the native tool")
+    goal_attempt.add_argument("--run-id", required=True)
+    goal_attempt.add_argument("--goal-thread-id", required=True)
+    goal_attempt.set_defaults(func=command_pipeline)
+    goal_bind = sub.add_parser("pipeline-goal-bind", help="Bind pipeline runs to the current Goal baseline")
+    goal_bind.add_argument("--run-id", required=True)
+    goal_bind.add_argument("--initial-fingerprint", required=True)
+    goal_bind.add_argument("--goal-thread-id", required=True)
+    goal_bind.add_argument("--goal-receipt", required=True)
+    goal_bind.set_defaults(func=command_pipeline)
+    goal_reopen = sub.add_parser("pipeline-goal-reopen", help="Reopen a sealed pipeline cycle for a still-active Goal")
+    goal_reopen.add_argument("--run-id", required=True)
+    goal_reopen.add_argument("--initial-fingerprint", required=True)
+    goal_reopen.add_argument("--sealed-at", required=True)
+    goal_reopen.add_argument("--reason", required=True)
+    goal_reopen.add_argument("--goal-receipt", required=True)
+    goal_reopen.set_defaults(func=command_pipeline)
+    goal_advance = sub.add_parser("pipeline-goal-advance", help="Confirm native Goal completion and allow a new cycle")
+    goal_advance.add_argument("--run-id", required=True)
+    goal_advance.add_argument("--initial-fingerprint", required=True)
+    goal_advance.add_argument("--sealed-at", required=True)
+    goal_advance.add_argument("--goal-receipt", required=True)
+    goal_advance.set_defaults(func=command_pipeline)
+    goal_status = sub.add_parser("pipeline-goal-status", help="Recheck a Goal's original inbox across later runs")
+    goal_status.add_argument("--run-id", required=True)
+    goal_status.add_argument("--initial-fingerprint", required=True)
+    goal_status.add_argument("--seal", action="store_true", help="Seal a fully accounted Goal cycle before marking the Goal complete")
+    goal_status.add_argument("--goal-receipt", help="Saved current active native Goal result, required for sealing")
+    goal_status.add_argument("--review-evidence", help="Current residual review receipt when review is due")
+    goal_status.set_defaults(func=command_pipeline)
     issue = sub.add_parser("pipeline-issue")
     issue.add_argument("--from-json", required=True)
+    issue.add_argument("--run-id", help="Explicitly associate this assessment with an active run")
     issue.set_defaults(func=command_pipeline)
     audit_cycle = sub.add_parser("pipeline-audit")
     audit_cycle.add_argument("--run-id", required=True)
     audit_cycle.add_argument("--weekly", action="store_true")
+    audit_cycle.add_argument("--reconcile-parser", action="store_true",
+                             help="Refresh parser migration with full current coverage")
+    audit_cycle.add_argument("--full", action="store_true",
+                             help="Run a full comparison while retaining actual changed-file accounting")
     audit_cycle.add_argument("--target", action="append")
     audit_cycle.set_defaults(func=command_pipeline_audit)
     finish = sub.add_parser("pipeline-finish")
     finish.add_argument("--run-id", required=True)
     finish.add_argument("--status", required=True, choices=["completed", "partial", "failed"])
+    finish.add_argument("--blocker-scope", choices=["notes", "operational", "mixed", "unknown"],
+                        help="Classify a partial/failed run; omit to retain unknown provenance")
     finish.add_argument("--summary", required=True)
     finish.add_argument("--report", default="")
     finish.add_argument("--target", action="append")

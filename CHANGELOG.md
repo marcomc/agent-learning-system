@@ -6,6 +6,75 @@ The project follows semantic versioning.
 
 ## Unreleased
 
+## [2.0.0] - 2026-11-16
+
+### Breaking
+
+- Require `--goal-mode scheduled` or `--goal-mode manual` when starting a new
+  pipeline run. Existing callers must choose the appropriate mode explicitly.
+
+### Added
+
+- Verify eligible historical note integrations against the release candidate
+  before merge while retaining the original integration history.
+- Assess independently reviewed unrelated audit, operational and review issues
+  separately from candidate readiness, without reading their external files.
+- Support evidence-bound candidate assessments for explicitly authorized audit
+  and review deferrals, retaining open findings and strict default release checks.
+- Preserve the recorded receipt chain when a relocated historical target later
+  gains an independently reviewed semantic successor.
+- Record and revalidate recovery evidence for interrupted runs without changing
+  their historical outcomes or treating unknown runner attribution as known.
+- Correlate bounded Codex heartbeat captures with the exact run-start command;
+  retain `unknown` when correlation is unavailable, without blocking notes.
+- Save Goal-attempt ownership before native creation so interrupted attempts
+  are reconciled before another scheduled run; historical runs without a mode
+  retain unknown provenance.
+- Reconcile historical integration targets across worktrees with explicit,
+  evidence-bound mappings and revalidation on later audits, including reviewed
+  semantic successors for complete historical note groups. See
+  [historical target relocation](docs/integration-target-relocation.md).
+- Coordinate each scheduled consolidation with a native Goal bound to its
+  initial inbox snapshot, including continuation, sealing and reconciliation of
+  changed evidence before starting a new cycle.
+- Audit integration receipts for an individual run or explicitly selected
+  historical scope, retaining exact note attribution and incomplete outcomes.
+
+### Changed
+
+- Keep English notification alerts in fixed English and link to the original
+  decision details, while detecting changed issues and runs for reminders.
+- Assess receipt and release dependencies before changing shared instruction
+  context, while keeping unrelated historical debt out of the inbox path.
+- Group repeated audit findings across the same two files for shared assessment,
+  preserving each finding and requiring revalidation when its context changes.
+- Limit consolidation completion checks to issues related to the current run;
+  retain unrelated findings as separate release-readiness work.
+- Bound state, source and receipt reads so unavailable evidence remains
+  retryable instead of indefinitely holding a consolidation lock.
+- Keep explicitly authorized post-publication checks open while binding release
+  readiness to their candidate version, checkout and current evidence.
+
+### Fixed
+
+- Require each pending joint-review decision to have a source-linked issue
+  before sealing a Goal, and detect changes to those issues before completion.
+- Allow audit-origin instruction changes to use coherence review without
+  fabricating a source note, while preserving current issue, preimage, cohort
+  and independent-review checks.
+- Scan each instruction file once when audit roots include symbolic-link
+  aliases, avoiding duplicate findings and unusable audit baselines.
+- Compare complete wrapped dash-list rules and skip fenced examples, with a
+  versioned reparse and explicit reconciliation of affected prior findings.
+- Preserve structured evidence and legacy escape sequences when reading and
+  rewriting learning-note metadata.
+- Preserve native Goal completion results for cycle advancement when a later
+  Goal lookup returns no active Goal.
+- Preserve initial inbox identity, reconciliation issues and current receipt
+  checks across retries and interrupted Goal transitions.
+- Open automation chats through a browser-compatible link while preserving
+  existing notification deduplication and a local application fallback.
+
 ## [1.3.1] - 2026-11-09
 
 ### Fixed

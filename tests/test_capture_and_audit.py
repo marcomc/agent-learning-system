@@ -441,11 +441,190 @@ class CaptureAndAuditTests(unittest.TestCase):
 
     def test_audit_reports_size_without_claiming_semantic_or_check_approval(self) -> None:
         _, _, first = self.rules_and_baseline()
+        self.assertEqual(first["rule_parser_version"], 2)
         self.assertEqual(len(first["file_snapshots"]), 2)
         self.assertTrue(first["exact_duplicates"])
         self.assertFalse(first["semantic_approval"])
         self.assertEqual(first["check_effectiveness"], "not-evaluated")
         self.assertGreater(first["file_snapshots"][0]["words"], 0)
+
+    def test_audit_deduplicates_symlinked_targets_and_reuses_baseline(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "original.md"
+        source.write_text("# Rules\n\n- Verify the complete deployment before declaring it finished.\n")
+        alias = self.directory / "alias.md"
+        alias.symlink_to(source)
+        first = json.loads(self.audit("--path", str(alias)).stdout)
+        self.assertEqual(len(first["file_snapshots"]), 1)
+        self.assertEqual(first["file_snapshots"][0]["path"], str(alias))
+        self.assertEqual(len(first["scanned_files"]), 1)
+        self.assertFalse(first["exact_duplicates"])
+        baseline = self.directory / "baseline.json"
+        baseline.write_text(json.dumps(first))
+        second = json.loads(self.audit("--path", str(alias), "--baseline", str(baseline)).stdout)
+        self.assertFalse(second["changed_files"])
+        self.assertFalse(second["removed_files"])
+
+        # Reports made before deduplication may contain two spellings of the
+        # same file. Reuse them only when their recorded evidence agrees.
+        old_alias = {**first["file_snapshots"][0], "path": str(source)}
+        if old_alias["path"] == first["file_snapshots"][0]["path"]:
+            old_alias["path"] = str(alias)
+        legacy = {**first, "file_snapshots": first["file_snapshots"] + [old_alias]}
+        baseline.write_text(json.dumps(legacy))
+        restored = json.loads(self.audit("--path", str(alias), "--baseline", str(baseline)).stdout)
+        self.assertFalse(restored["changed_files"])
+        old_alias["sha256"] = "0" * 64
+        baseline.write_text(json.dumps(legacy))
+        self.assertNotEqual(self.audit("--baseline", str(baseline), check=False).returncode, 0)
+
+    def test_audit_compares_complete_wrapped_bullets(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        (rules / "a.md").write_text(
+            "# Rules\n\n- At the start of a chat, read\n  `pyproject.toml`.\n"
+            "- Keep the verified evidence\n  with the release.\n"
+        )
+        (rules / "b.md").write_text(
+            "# Rules\n\n- At the start of a chat, read\n  `docs/TESTING.md`.\n"
+            "- Keep the verified evidence\n  with the release.\n"
+        )
+        result = json.loads(self.audit().stdout)
+        texts = [{entry["text"] for entry in group} for group in result["exact_duplicates"]]
+        self.assertEqual(texts, [{"Keep the verified evidence with the release."}])
+        self.assertEqual({entry["line"] for entry in result["exact_duplicates"][0]}, {5})
+
+    def test_audit_ignores_bullets_inside_tilde_and_backtick_fences(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        (rules / "a.md").write_text(
+            "# Rules\n\n~~~md\n- A fenced example is not an instruction.\n~~~\n"
+            "```md\n- Another fenced example is not an instruction.\n```\n"
+            "- Inspect the actual current target before promotion.\n"
+        )
+        (rules / "b.md").write_text(
+            "# Rules\n\n- A fenced example is not an instruction.\n"
+            "- Another fenced example is not an instruction.\n"
+        )
+        result = json.loads(self.audit().stdout)
+        self.assertEqual(result["exact_duplicates"], [])
+        self.assertEqual(result["rule_count"], 3)
+
+    def test_indented_code_does_not_open_a_fence_or_hide_following_rules(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        (rules / "a.md").write_text(
+            "# Rules\n\n    ```\n    - This is indented code, not a rule.\n"
+            "- Inspect the actual current target before promotion.\n"
+            "  ```md\n  - A nested fenced example is not a rule.\n  ```\n"
+            "- Preserve the saved review evidence.\n"
+        )
+        result = json.loads(self.audit().stdout)
+        self.assertEqual(result["rule_count"], 2)
+
+    def test_lazy_list_continuation_stops_at_a_blank_paragraph(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text(
+            "# Rules\n\n- Keep the release evidence\ncurrent before promotion.\n"
+            "\nUnrelated paragraph.\n\n- Preserve the original receipt.\n"
+        )
+        bullets = self.module.iter_markdown_bullets(source)
+        self.assertEqual([x["text"] for x in bullets], [
+            "Keep the release evidence current before promotion.",
+            "Preserve the original receipt.",
+        ])
+
+    def test_invalid_backtick_fence_info_does_not_hide_following_rules(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        (rules / "a.md").write_text(
+            "# Rules\n\n```language`invalid\n"
+            "- Inspect the actual current target before promotion.\n"
+        )
+        result = json.loads(self.audit().stdout)
+        self.assertEqual(result["rule_count"], 1)
+
+    def test_nested_rules_survive_checkboxes_and_blank_lines(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text(
+            "# Rules\n\n- [ ] Checklist\n    - Preserve the evidence.\n"
+            "- Parent rule.\n\n    - Preserve the receipt.\n"
+        )
+        self.assertEqual([x["text"] for x in self.module.iter_markdown_bullets(source)], [
+            "Preserve the evidence.", "Parent rule.", "Preserve the receipt.",
+        ])
+
+    def test_nested_dash_rules_under_other_list_markers_are_not_lost(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text(
+            "# Rules\n\n1. Ordered parent\n    - Preserve ordered evidence.\n"
+            "* Unordered parent\n    - Preserve unordered evidence.\n"
+            "+ Alternative parent\n    - Preserve alternative evidence.\n"
+        )
+        self.assertEqual([x["text"] for x in self.module.iter_markdown_bullets(source)], [
+            "Preserve ordered evidence.", "Preserve unordered evidence.", "Preserve alternative evidence.",
+        ])
+
+    def test_nested_rules_use_actual_parent_content_indentation(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text(
+            "# Rules\n\n123456789. Wide parent\n           - Preserve wide-parent evidence.\n"
+            "-    Padded parent\n      - Preserve padded-parent evidence.\n"
+        )
+        self.assertEqual([x["text"] for x in self.module.iter_markdown_bullets(source)], [
+            "Preserve wide-parent evidence.", "Padded parent", "Preserve padded-parent evidence.",
+        ])
+
+    def test_excess_list_padding_is_indented_code_not_a_rule(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text(
+            "# Rules\n\n-     example code\n      - Hidden example.\n"
+            "1.     another code example\n       - Another hidden example.\n"
+            "- Actual rule.\n"
+        )
+        self.assertEqual([x["text"] for x in self.module.iter_markdown_bullets(source)], ["Actual rule."])
+
+    def test_outdent_outside_wide_parent_is_not_a_nested_rule(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text(
+            "123456789. Parent\n           - Nested rule.\n"
+            "          - Indented code, not a nested rule.\n- Actual rule.\n"
+        )
+        self.assertEqual([x["text"] for x in self.module.iter_markdown_bullets(source)], [
+            "Nested rule.", "Actual rule.",
+        ])
+
+    def test_root_fence_after_bullet_rejects_overindented_closer(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text(
+            "# Rules\n\n- Parent rule.\n```md\n    ```\n"
+            "- Hidden example, not a rule.\n```\n- Actual rule.\n"
+        )
+        self.assertEqual([x["text"] for x in self.module.iter_markdown_bullets(source)], [
+            "Parent rule.", "Actual rule.",
+        ])
+
+    def test_fence_started_on_list_marker_does_not_emit_example_bullets(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        source = rules / "a.md"
+        source.write_text("# Rules\n\n- ```md\n  - Hidden example.\n  ```\n- Actual rule.\n")
+        self.assertEqual([x["text"] for x in self.module.iter_markdown_bullets(source)], ["Actual rule."])
 
     def test_unchanged_audit_reuses_baseline_without_repeating_pairs(self) -> None:
         _, baseline, _ = self.rules_and_baseline()
@@ -455,6 +634,35 @@ class CaptureAndAuditTests(unittest.TestCase):
         self.assertEqual(result["exact_duplicates"], [])
         self.assertEqual(result["comparison_scope"], "changed-targets")
         self.assertEqual(baseline.read_bytes(), before)
+
+    def test_legacy_baseline_reparses_unchanged_files_without_calling_them_changed(self) -> None:
+        rules = self.directory / "rules"
+        rules.mkdir()
+        for name in ("a.md", "b.md"):
+            (rules / name).write_text("# Rules\n\n- Retain the verified evidence\n  with the release.\n")
+        legacy = json.loads(self.audit().stdout)
+        legacy.pop("rule_parser_version")
+        baseline = self.directory / "legacy-audit.json"
+        baseline.write_text(json.dumps(legacy))
+        result = json.loads(self.audit("--baseline", str(baseline)).stdout)
+        self.assertEqual(result["changed_files"], [])
+        self.assertEqual(result["comparison_scope"], "full")
+        self.assertTrue(result["parser_reparse"])
+        self.assertEqual(len(result["exact_duplicates"]), 1)
+        self.assertEqual(result["exact_duplicates"][0][0]["text"],
+                         "Retain the verified evidence with the release.")
+        self.assertEqual(len(result["legacy_parse_changes"]), 2)
+        self.assertTrue(all(item["text"] == "Retain the verified evidence"
+                            and item["current_text"] == "Retain the verified evidence with the release."
+                            for item in result["legacy_parse_changes"]))
+
+    def test_baseline_rejects_invalid_or_future_parser_versions(self) -> None:
+        _, baseline, payload = self.rules_and_baseline()
+        for version in (True, 2.0, 3):
+            with self.subTest(version=version):
+                baseline.write_text(json.dumps({**payload, "rule_parser_version": version}))
+                result = self.audit("--baseline", str(baseline), check=False)
+                self.assertNotEqual(result.returncode, 0)
 
     def test_changed_target_is_compared_with_unchanged_coverage(self) -> None:
         rules, baseline, _ = self.rules_and_baseline()

@@ -93,6 +93,25 @@ proposal; changed context, source, consumers or review evidence requires recheck
 Old distribution-only receipts remain historical evidence and cannot establish
 current integrated status under this contract.
 
+For a change discovered by the instruction audit without a source learning note,
+use `audit-coherence-source --issue-id ID --audit-report REPORT` to obtain each
+current issue binding from its registered, intact audit report before editing
+the discovered targets.
+In the manifest set `note_ids` to an empty list and put those bindings in
+`audit_sources`. Only current `candidate` or `investigate` findings are eligible;
+preserve user decisions and revalidate stale findings first. Cover every discovery
+target with its exact recorded preimage, including complete cohort membership.
+One review covers at most eight audit reports and 32 MiB of report content;
+split larger independent reviews without splitting a coherent change. If one
+coherent review exceeds either bound, leave it open and record that it requires
+a larger bounded verification path before promotion.
+Run `audit-coherence-proposal --manifest FILE`, obtain the required independent
+reviews of its frozen hash, then run `audit-coherence-check --manifest FILE`.
+Save its verified output with the manifest and reviews as audit evidence; recheck
+it before relying on it if the audit, target, context or distribution changes.
+This path does not create or certify a note integration receipt. A stale finding,
+omitted target, changed preimage or projection mismatch requires reassessment.
+
 ## Cumulative review
 
 Before closing each changed target, assess its complete composed contract, not

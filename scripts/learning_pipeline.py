@@ -3240,13 +3240,22 @@ class Pipeline:
             stale = issue.get("revalidation_required") or any(not current(ref) for ref in issue.get("targets", []) + sources)
             if stale:
                 if language == "it":
-                    item = {"id": issue["id"], "status": "investigate", "title": "Revalidation required",
-                            "description": clean(issue["title"]) + ": source or target changed; the agent must reassess it.",
+                    item = {"id": issue["id"], "status": "investigate", "title": "Reassessment required",
+                            "description": ("A source or target changed. Review and reassess the listed issues using the current details in the linked chat."
+                                            if url else "A source or target changed. Run `python3 scripts/agent_learning.py pipeline-status` in the configured checkout for details."),
+                            "reassessment": True,
+                            "reassessment_entry": {"kind": issue.get("kind", "issue"),
+                                                  "title": clean(issue.get("title", "Reassessment")),
+                                                  "description": clean(issue.get("description", ""))},
                             "options": [], "question": ""}
                 else:
                     item = {"id": issue["id"], "status": "investigate", "title": "Reassessment required",
-                            "description": (f"Issue {issue['id']}: a source or target changed. Open the linked chat for current details."
-                                            if url else f"Issue {issue['id']}: a source or target changed. Run `python3 scripts/agent_learning.py pipeline-status` in the configured checkout for details."),
+                            "description": ("A source or target changed. Review and reassess the listed issues using the current details in the linked chat."
+                                            if url else "A source or target changed. Run `python3 scripts/agent_learning.py pipeline-status` in the configured checkout for details."),
+                            "reassessment": True,
+                            "reassessment_entry": {"kind": issue.get("kind", "issue"),
+                                                  "title": clean(issue.get("title", "Reassessment")),
+                                                  "description": clean(issue.get("description", ""))},
                             "options": [], "question": ""}
             elif issue["id"].startswith("goal-reconcile-"):
                 if language == "it":
@@ -3444,10 +3453,56 @@ def render(items: list[dict[str, Any]], language: str = "en") -> tuple[str, str]
     text = ["Agent Learning — " + heading, "", intro, ""]
     blocks = []
     esc = lambda value: html.escape(clean(value), quote=True)
+    display_items = []
+    reassessment_groups = {}
     for item in items:
+        if not item.get("reassessment"):
+            display_items.append(item)
+            continue
+        key = (item["title"], item["description"])
+        group = reassessment_groups.get(key)
+        if group is None:
+            group = {**item, "entries": [], "chat_links": []}
+            reassessment_groups[key] = group
+            display_items.append(group)
+        group["entries"].append(item.get("reassessment_entry", {}))
+        link = (item.get("chat_url", ""), item.get("native_chat_url", ""))
+        if link[0] and link not in group["chat_links"]:
+            group["chat_links"].append(link)
+    for item in display_items:
         text += [clean(item["title"]), clean(item["description"]), ""]
         content = f'<h2 style="font-size:20px;line-height:1.4;margin:0 0 12px">{esc(item["title"])}</h2>'
         content += f'<p style="margin:0 0 16px">{esc(item["description"])}</p>'
+        if item.get("entries"):
+            entries = sorted(item["entries"], key=lambda entry: ({"operational": 0, "review": 1, "audit": 2}.get(entry.get("kind"), 3)))
+            kind_counts = {}
+            for entry in entries:
+                kind_counts[entry.get("kind", "issue")] = kind_counts.get(entry.get("kind", "issue"), 0) + 1
+            kind_labels = {"operational": "follow-ups", "review": "note reviews", "audit": "audit findings"}
+            breakdown = ", ".join(f"{count} {kind_labels.get(kind, kind + ' issues')}"
+                                   for kind, count in sorted(kind_counts.items(), key=lambda pair: (0 if pair[0] == "operational" else 1 if pair[0] == "review" else 2, pair[0])))
+            shown = entries[:10]
+            remaining = len(entries) - len(shown)
+            text += [f"{len(entries)} issues to reassess ({breakdown}).", "", f"First {len(shown)}:"]
+            content += f'<p style="margin:0 0 12px"><strong>{len(entries)} issues to reassess</strong> ({esc(breakdown)}).</p>'
+            content += '<ol style="padding-left:24px;margin:0 0 16px">'
+            for entry in shown:
+                title = clean(entry.get("title", "Reassessment"))
+                description = clean(entry.get("description", ""))
+                if len(description) > 220:
+                    description = description[:217].rsplit(" ", 1)[0] + "…"
+                text.append(f"- {title}" + (f": {description}" if description else ""))
+                content += f'<li style="margin:0 0 10px"><strong>{esc(title)}</strong>'
+                if description:
+                    content += f'<br>{esc(description)}'
+                content += '</li>'
+            content += '</ol>'
+            if remaining:
+                more = f"{remaining} more issue(s) are listed in the linked chat."
+                text += ["", more, ""]
+                content += f'<p style="margin:0 0 16px">{more}</p>'
+            else:
+                text.append("")
         if item["status"] == "needs-user":
             if item.get("decision_details_unavailable"):
                 fallback = ("Apri la chat collegata per leggere la domanda e le opzioni originali, poi rispondi lì."
@@ -3469,12 +3524,13 @@ def render(items: list[dict[str, Any]], language: str = "en") -> tuple[str, str]
                                else f'Reply in the chat with "{clean(item["id"])}: option ID" and any constraints.')
                 text += [instruction, ""]
                 content += f'<p style="margin:0 0 16px">{esc(instruction)}</p>'
-        if item.get("chat_url"):
-            text += [link_label + ": " + item["chat_url"], ""]
-            content += f'<p style="margin:0"><a style="color:#175cd3;text-decoration:underline" href="{esc(item["chat_url"])}">{link_label}</a></p>'
+        chat_links = item.get("chat_links") or ([(item["chat_url"], item["native_chat_url"])] if item.get("chat_url") else [])
+        for chat_url_value, native_chat_url_value in chat_links:
+            text += [link_label + ": " + chat_url_value, ""]
+            content += f'<p style="margin:0"><a style="color:#175cd3;text-decoration:underline" href="{esc(chat_url_value)}">{link_label}</a></p>'
             fallback = ("If your mail app blocks the link, run this command in Terminal on the Mac running Codex:"
                         if not italian else "Se la posta blocca il link, esegui questo comando nel Terminale del Mac con Codex:")
-            command = "open '" + item["native_chat_url"] + "'"
+            command = "open '" + native_chat_url_value + "'"
             text += [fallback, command, ""]
             content += f'<p>{fallback}<br><code>{esc(command)}</code></p>'
         blocks.append('<section style="padding:24px 0;border-bottom:1px solid #dfe3e8;overflow-wrap:anywhere;word-break:break-word">' + content + '</section>')

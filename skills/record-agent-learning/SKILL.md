@@ -1,6 +1,8 @@
 ---
 name: record-agent-learning
 description: Use when capturing a real reusable finding, fix, regression, or workflow lesson, or when explicitly asked to install the capture hook into local review skills.
+metadata:
+  agent-learning-system-version: "2.0.1"
 ---
 
 <!-- MARCOMC-SKILL: owner="MarcoMC <marco@marcomc.com>"; repository="marcomc/skills"; provenance="original" -->

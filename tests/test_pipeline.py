@@ -4647,6 +4647,40 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("  Remove & verify. Then stop.", body)
         self.assertIn(web_url, body)
 
+    def test_renderer_groups_reassessment_items_and_deduplicates_chat_links(self):
+        from learning_pipeline import render
+
+        items = []
+        for index in range(12):
+            thread_id = ORDINARY if index < 11 else "a" * 36
+            items.append({
+                "id": f"audit-{index}", "status": "investigate",
+                "title": "Reassessment required",
+                "description": "A source or target changed. Review the current details.",
+                "reassessment": True,
+                "reassessment_entry": {
+                    "kind": "audit" if index < 8 else "operational",
+                    "title": f"Finding {index}",
+                    "description": f"Reason {index}",
+                },
+                "chat_url": "https://chatgpt.com/codex/open-app?codex_thread_id=" + thread_id,
+                "native_chat_url": "codex://threads/" + thread_id,
+            })
+
+        body, markup = render(items, "en")
+
+        self.assertEqual(body.count("Reassessment required"), 1)
+        self.assertIn("12 issues to reassess (4 follow-ups, 8 audit findings).", body)
+        self.assertIn("First 10:", body)
+        self.assertIn("2 more issue(s) are listed in the linked chat.", body)
+        self.assertIn("Finding 9: Reason 9", body)
+        self.assertNotIn("Finding 6", body)
+        self.assertNotIn("audit-", body)
+        self.assertEqual(body.count("Open the chat to respond:"), 2)
+        self.assertEqual(markup.count("Reassessment required</h2>"), 1)
+        self.assertEqual(markup.count("href=\"https://chatgpt.com/codex/open-app?codex_thread_id="), 2)
+        self.assertNotIn("audit-", markup)
+
     def test_legacy_issue_signatures_trigger_one_migration_notice_and_track_changes(self):
         issue = self.decision()
         issue.update(title="Scelta di conservazione", description="La fonte può essere conservata o rimossa.",
@@ -5119,10 +5153,10 @@ class PipelineTests(unittest.TestCase):
         stale = next(item for item in digest["items"] if item["id"] == "stale-runtime")
 
         self.assertIn("pipeline-status", stale["description"])
-        self.assertIn("Issue stale-runtime", stale["description"])
+        self.assertNotIn("stale-runtime", stale["description"])
         self.assertNotIn("linked chat", stale["description"])
-        self.assertNotIn("Controllo runtime", digest["body"])
-        self.assertNotIn("Verifica il runtime", digest["body"])
+        self.assertIn("Controllo runtime", digest["body"])
+        self.assertIn("Verifica il runtime", digest["body"])
 
     def test_release_gate_rejects_a_newer_failed_cycle(self):
         self.pipeline.begin("run-1", "midnight", initial_inbox=[])

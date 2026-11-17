@@ -6,6 +6,18 @@ The project follows semantic versioning.
 
 ## Unreleased
 
+## [2.0.1] - 2026-11-17
+
+### Changed
+
+- Mark both distributed learning skills with the Agent Learning System release
+  version they come from.
+
+### Fixed
+
+- Group reassessment alerts into one digest section, show the first ten issues
+  with their context and category counts, and retain one link per distinct chat.
+
 ## [2.0.0] - 2026-11-16
 
 ### Breaking

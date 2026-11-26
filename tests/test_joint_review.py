@@ -421,6 +421,42 @@ class JointReviewTests(unittest.TestCase):
             self.assertEqual(result.returncode, expected, result.stderr)
             self.assertEqual(sentinel.read_text(), "existing-config\n")
 
+    def test_installer_validation_does_not_inherit_live_learning_configuration(self) -> None:
+        bins = self.directory / "validation-bin"
+        bins.mkdir()
+        for tool in ("markdownlint", "shellcheck"):
+            stub = bins / tool
+            stub.write_text("#!/bin/sh\nexit 0\n")
+            stub.chmod(0o755)
+        fixture = self.directory / "validation-repo"
+        (fixture / "scripts").mkdir(parents=True)
+        (fixture / "tests").mkdir()
+        for script in ("install.sh", "scripts/check.sh"):
+            (fixture / script).write_bytes((REPO / script).read_bytes())
+        (fixture / "tests/test_environment.py").write_text(
+            "import os, unittest\n"
+            "class ValidationEnvironmentTests(unittest.TestCase):\n"
+            "    def test_isolation(self):\n"
+            "        self.assertFalse(any(key.startswith(('AGENT_LEARNING_', 'CODEX_')) "
+            "for key in os.environ))\n"
+            "        self.assertEqual(os.environ['VALIDATION_CANARY'], 'present')\n"
+        )
+        env = {
+            **os.environ,
+            "PATH": str(bins) + os.pathsep + os.environ["PATH"],
+            "AGENT_LEARNING_DIR": str(self.base),
+            "AGENT_LEARNING_EMAIL": "live@example.invalid",
+            "AGENT_LEARNING_EMAIL_PROVIDER": "msmtp",
+            "CODEX_THREAD_ID": "live-thread",
+            "VALIDATION_CANARY": "present",
+        }
+        result = subprocess.run(
+            ["bash", str(fixture / "install.sh"), "--validate-only"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ran 1 test", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

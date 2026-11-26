@@ -122,6 +122,18 @@ fi
 
 validate_project
 
+SKILL_BACKUP_ROOT=$(python3 -c '
+from pathlib import Path
+import sys
+
+backup = Path(sys.argv[1]).resolve()
+discovery = [Path(arg).resolve() for arg in sys.argv[2:]]
+if any(backup.is_relative_to(root) for root in discovery):
+    sys.exit("Skill backups must be outside active skill discovery paths.")
+print(backup)
+' "${HOME}/.local/state/agent-learning-system/skill-backups" \
+  "${HOME}/.agents/skills" "${HOME}/.codex/skills")
+
 mkdir -p "${CONFIG_DIR}"
 repo_value=$(quote_env "${SCRIPT_DIR}")
 learning_dir_value=$(quote_env "${LEARNING_DIR}")
@@ -145,19 +157,26 @@ skill_mode_value=$(quote_env "${SKILL_MODE}")
 
 python3 "${SCRIPT_DIR}/scripts/agent_learning.py" --config "${CONFIG_FILE}" init-store >/dev/null
 
+backup_skill() {
+  local dest=$1
+  local kind=$2
+  local backup_dir
+  local backup
+
+  mkdir -p -- "${SKILL_BACKUP_ROOT}"
+  backup_dir=$(mktemp -d "${SKILL_BACKUP_ROOT}/${kind}.XXXXXXXX")
+  backup="${backup_dir}/$(basename -- "${dest}")"
+  mv -- "${dest}" "${backup}"
+  printf 'Backed up existing %s to %s\n' "${dest}" "${backup}"
+}
+
 install_path() {
   local source=$1
   local dest=$2
-  local backup
-  local timestamp
 
   mkdir -p "$(dirname -- "${dest}")"
-  timestamp=$(date +%Y%m%d%H%M%S)
-
   if [[ -e "${dest}" || -L "${dest}" ]]; then
-    backup="${dest}.backup.${timestamp}"
-    mv "${dest}" "${backup}"
-    printf 'Backed up existing %s to %s\n' "${dest}" "${backup}"
+    backup_skill "${dest}" agent
   fi
 
   cp -R "${source}" "${dest}"
@@ -166,12 +185,9 @@ install_path() {
 install_codex_link() {
   local agent_dest=$1
   local codex_dest=$2
-  local backup
   local existing_target
-  local timestamp
 
   mkdir -p "$(dirname -- "${codex_dest}")"
-  timestamp=$(date +%Y%m%d%H%M%S)
   existing_target=""
   if [[ -L "${codex_dest}" ]]; then
     existing_target=$(readlink "${codex_dest}")
@@ -180,9 +196,7 @@ install_codex_link() {
     if [[ -L "${codex_dest}" && "${existing_target}" == "${agent_dest}" ]]; then
       return 0
     fi
-    backup="${codex_dest}.backup.${timestamp}"
-    mv "${codex_dest}" "${backup}"
-    printf 'Backed up existing %s to %s\n' "${codex_dest}" "${backup}"
+    backup_skill "${codex_dest}" codex
   fi
   ln -s "${agent_dest}" "${codex_dest}"
 }

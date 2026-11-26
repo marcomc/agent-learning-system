@@ -2,7 +2,7 @@
 name: consolidate-agent-learnings
 description: Consolidate Obsidian agent-learning notes by promoting strong reusable lessons into global AGENTS.md, relevant review skills, the touched project AGENTS.md, and agent templates while archiving processed notes.
 metadata:
-  agent-learning-system-version: "2.0.2"
+  agent-learning-system-version: "2.0.3"
 ---
 
 <!-- MARCOMC-SKILL: owner="MarcoMC <marco@marcomc.com>"; repository="marcomc/skills"; provenance="original" -->

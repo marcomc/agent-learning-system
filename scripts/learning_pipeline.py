@@ -844,9 +844,13 @@ def verify_unrelated_issue(issue: dict[str, Any], record: dict[str, Any], candid
         refs = issue.get(field)
         if not isinstance(refs, list) or (field == "targets" and not refs):
             raise ValueError("An unrelated finding needs explicit, well-formed source and target references.")
+        allowed_fields = [frozenset({"path", "sha256"})]
+        if field == "sources":
+            allowed_fields.append(frozenset({"path", "sha256", "note_id"}))
         seen = set()
         for ref in refs:
-            if (not isinstance(ref, dict) or set(ref) != {"path", "sha256"}
+            if (not isinstance(ref, dict) or frozenset(ref) not in allowed_fields
+                    or ("note_id" in ref and (not isinstance(ref["note_id"], str) or not clean(ref["note_id"])))
                     or not isinstance(ref.get("path"), str) or not Path(ref["path"]).is_absolute()
                     or not isinstance(ref.get("sha256"), str)
                     or not re.fullmatch(r"[a-f0-9]{64}", ref["sha256"])):

@@ -78,8 +78,10 @@ classified `unrelated` after an independent review confirms that neither its
 sources and targets nor its functional dependencies affect the candidate. The
 assessment records `scope_review` with the issue and candidate fingerprints,
 distinct reviewer and assessment author, and the rationale, candidate relation
-and dependency review. Use an empty `evidence` list for that record: the gate
+and dependency review. Use an empty `evidence` list for that record. The gate
 does not read external source, target or evidence files for this classification.
+A source reference may include its saved `note_id` alongside `path` and `sha256`.
+The complete source reference remains bound to the issue fingerprint.
 The reviewer must independently establish relevance; the gate validates the
 bindings but does not authenticate the reviewer or prove semantic independence.
 The issue remains open and is reported separately. The parser snapshot skips exact canonical external paths covered by an unrelated audit

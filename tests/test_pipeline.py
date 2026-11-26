@@ -3049,6 +3049,36 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn(issue["id"], release["deferred_issue_ids"])
         self.assertEqual(self.pipeline.status()["issues"], before["issues"])
 
+    def test_scoped_release_accepts_unrelated_review_source_with_note_identity(self):
+        self.complete_release_cycle("release-unrelated-note")
+        issue, _, _, _ = self.add_foreign_investigation()
+        issue["kind"] = "review"
+        issue["sources"] = [{**self.ref(self.note), "note_id": "note-1"}]
+        self.pipeline.update_issue(issue)
+        candidate_root, _, _ = self.release_candidate()
+        _, assessment = self.unrelated_assessment(issue["id"], candidate_root)
+
+        result = self.pipeline.weekly_release_status(
+            assessment_path=str(assessment), candidate_root=candidate_root
+        )
+
+        self.assertEqual(result["release_assessment"]["unrelated_issue_ids"], [issue["id"]])
+        current = self.pipeline.status()["issues"][issue["id"]]
+        self.assertEqual(current["sources"], issue["sources"])
+        self.assertEqual(current["status"], "investigate")
+
+        for field, invalid_ref in (
+            ("sources", {**issue["sources"][0], "note_id": ""}),
+            ("targets", {**issue["targets"][0], "note_id": "note-1"}),
+        ):
+            with self.subTest(field=field):
+                self.pipeline.update_issue({**issue, field: [invalid_ref]})
+                _, assessment = self.unrelated_assessment(issue["id"], candidate_root)
+                with self.assertRaisesRegex(ValueError, "well-formed source and target references"):
+                    self.pipeline.weekly_release_status(
+                        assessment_path=str(assessment), candidate_root=candidate_root
+                    )
+
     def test_scoped_release_ignores_only_reviewed_external_audit_snapshot_file(self):
         import learning_pipeline
         issue, _, target, evidence = self.add_foreign_investigation("audit-foreign-snapshot")

@@ -6,6 +6,13 @@ The project follows semantic versioning.
 
 ## Unreleased
 
+## [2.0.3] - 2026-11-26
+
+### Fixed
+
+- Keep installer rollback copies outside skill discovery and reject state paths that redirect them into the active skill directories. (rollback-discovery)
+- Accept note-linked source references in ordinary scoped release assessments while preserving issue identity and protection checks. (scoped-note-identity)
+
 ## [2.0.2] - 2026-11-26
 
 ### Fixed

@@ -4075,6 +4075,57 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "current source and target evidence"):
             self.pipeline.weekly_release_status(assessment_path=str(assessment), candidate_root=candidate_root)
 
+    def test_scoped_release_checks_archived_cohort_member_and_reactivation(self):
+        issue, retired = self.resolved_audit_cohort("release-retirement-baseline")
+        previous = retired.read_bytes()
+        retired_ref = self.ref(retired)
+        archive = self.root / "reports" / "retired-contract.txt"
+        archive.write_bytes(previous)
+        peer_archive = self.root / "reports" / "retained-contract-preimage.txt"
+        peer_archive.write_bytes(self.target.read_bytes())
+        self.pipeline.begin("release-retirement", "noon", initial_inbox=[])
+        retired.unlink()
+        retirement = {"id": issue["id"], "status": "resolved", "resolution": "The former entry point was retired.",
+                      "retired_target": {"path": retired_ref["path"], "archive": self.ref(archive),
+                                         "peer_archive": self.ref(peer_archive)},
+                      "evidence": [issue["latest_audit"]["path"], str(self.report)]}
+        with self.assertRaisesRegex(ValueError, "Reconcile the audited instruction removal"):
+            self.pipeline.update_issue(retirement)
+        payload = {**self.audit_payload(False), "removed_files": [retired_ref["path"]]}
+        discovery = self.pipeline.audit("release-retirement", payload, [], False)
+        removal = next(row for row in self.pipeline.status()["issues"].values() if row.get("removed_path"))
+        self.pipeline.update_issue({"id": removal["id"], "status": "resolved",
+                                    "resolution": "The absent instruction was intentionally archived.",
+                                    "evidence": [discovery["snapshot"]["path"], str(self.report)]})
+        archive.write_bytes(previous + b"Changed archive.\n")
+        with self.assertRaisesRegex(ValueError, "exact archived cohort evidence"):
+            self.pipeline.update_issue(retirement)
+        archive.write_bytes(previous)
+        self.pipeline.update_issue(retirement, "release-retirement")
+        self.pipeline.finish("release-retirement", "completed", "Verified", str(self.report), [])
+        candidate, _, _ = self.release_candidate()
+        _, assessment = self.release_assessment(candidate)
+        self.pipeline.weekly_release_status(assessment_path=str(assessment), candidate_root=candidate)
+        from learning_pipeline import current_cohort
+        initial_peer = self.target.read_bytes()
+        self.target.write_bytes(initial_peer + b"Updated active instructions.\n")
+        self.assertTrue(current_cohort(self.pipeline.status()["issues"][issue["id"]]))
+        self.target.write_bytes(initial_peer)
+        archive.unlink()
+        with self.assertRaisesRegex(ValueError, "current source and target evidence"):
+            self.pipeline.weekly_release_status(assessment_path=str(assessment), candidate_root=candidate)
+        archive.write_bytes(previous)
+        retired.write_bytes(previous)
+        with self.assertRaisesRegex(ValueError, "present again"):
+            self.pipeline.weekly_release_status(assessment_path=str(assessment), candidate_root=candidate)
+        self.pipeline.begin("release-restored", "noon", initial_inbox=[])
+        original = json.loads(Path(issue["latest_audit"]["path"]).read_text())["audit"]
+        self.pipeline.audit("release-restored", original, [], False)
+        restored = self.pipeline.status()["issues"][issue["id"]]
+        self.assertTrue(restored["revalidation_required"])
+        self.assertNotIn("retired_target", restored)
+        self.assertEqual(restored["retired_target_history"], [retirement["retired_target"]])
+
     def test_scoped_release_assessment_blocks_missing_resolved_cohort_report(self):
         issue, _ = self.resolved_audit_cohort("release-missing-cohort-report")
         candidate_root, _, _ = self.release_candidate()

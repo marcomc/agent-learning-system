@@ -26,6 +26,18 @@ from a note, prior release, or generated report.
    identities and ensure the authorization covers every deferred issue. Do not
    extend an approval to additional issues or a changed candidate.
 
+## Retired audit cohort members
+
+Retiring an instruction can resolve a previously audited duplicate. Preserve
+the exact bytes of both files in the learning store's `reports/` directory and run a full
+audit that records the removal. Reconcile the protected removal issue with that
+audit and the retirement evidence. Then resolve the cohort with its original
+audit report and a `retired_target` containing the original absolute `path`
+and `archive` and `peer_archive` objects with each snapshot's `path` and
+`sha256`. The gate verifies the original membership and archived bytes across
+later edits to the remaining instruction. If the old file returns, rerun the
+full audit and reassess the cohort.
+
 ## Candidate integration
 
 Use `candidate_verified` only for an operational issue in `investigate` status,

@@ -10,6 +10,7 @@ The project follows semantic versioning.
 
 ### Fixed
 
+- Preserve audit history when a previously audited duplicate instruction is retired. (audit-cohort-retirement)
 - Keep installer rollback copies outside skill discovery and reject state paths that redirect them into the active skill directories. (rollback-discovery)
 - Accept note-linked source references in ordinary scoped release assessments while preserving issue identity and protection checks. (scoped-note-identity)
 

@@ -108,6 +108,11 @@ This setup flow follows `install.sh`, including validation, config creation,
 skill copy installation, Codex mirrors, automation setup guidance, and local
 checks.
 
+The installer stores replaced skill copies and Codex entries under
+`~/.local/state/agent-learning-system/skill-backups/`. Each replacement gets a
+unique rollback directory outside the active skill discovery paths. The
+installer rejects a state path that resolves inside either skill directory.
+
 ```mermaid
 flowchart LR
   accTitle: Install setup flow

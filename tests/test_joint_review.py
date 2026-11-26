@@ -457,6 +457,57 @@ class JointReviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Ran 1 test", result.stderr)
 
+    def test_installer_keeps_rollback_copies_outside_skill_discovery(self) -> None:
+        fixture = self.directory / "install-repo"
+        scripts = fixture / "scripts"
+        scripts.mkdir(parents=True)
+        (fixture / "install.sh").write_bytes((REPO / "install.sh").read_bytes())
+        (scripts / "check.sh").write_text("exit 0\n")
+        (scripts / "agent_learning.py").write_text("raise SystemExit(0)\n")
+
+        operator_home = self.directory / "installer-home"
+        agent_skills = operator_home / ".agents" / "skills"
+        codex_skills = operator_home / ".codex" / "skills"
+        names = ("record-agent-learning", "consolidate-agent-learnings")
+        original = {}
+        for name in names:
+            shipped = fixture / "skills" / name
+            shipped.mkdir(parents=True)
+            (shipped / "SKILL.md").write_text("released content")
+            for root, content in ((agent_skills, "previous agent"), (codex_skills, "previous Codex")):
+                dest = root / name
+                dest.mkdir(parents=True)
+                (dest / "SKILL.md").write_text(content)
+                original[str(dest)] = content
+
+        env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_LEARNING_")}
+        env.update(HOME=str(operator_home), XDG_CONFIG_HOME=str(operator_home / ".config"))
+        command = [
+            "bash", str(fixture / "install.sh"), "--dir", str(self.base), "--skip-automations",
+        ]
+        backup_root = operator_home / ".local/state/agent-learning-system/skill-backups"
+        backup_root.parent.mkdir(parents=True)
+        for discovery in (agent_skills, codex_skills / "nested"):
+            backup_root.symlink_to(discovery)
+            result = subprocess.run(command, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("outside active skill discovery", result.stderr)
+            self.assertFalse((operator_home / ".config/agent-learning-system/config.env").exists())
+            for destination, content in original.items():
+                self.assertEqual((Path(destination) / "SKILL.md").read_text(), content)
+            backup_root.unlink()
+        for _ in range(2):
+            result = subprocess.run(command, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for root in (agent_skills, codex_skills):
+                self.assertEqual({path.name for path in root.iterdir()}, set(names))
+            for name in names:
+                self.assertEqual((agent_skills / name / "SKILL.md").read_text(), "released content")
+                self.assertEqual((codex_skills / name).resolve(), (agent_skills / name).resolve())
+
+        backup_contents = [entry.read_text() for entry in backup_root.rglob("SKILL.md")]
+        self.assertCountEqual(backup_contents, [*original.values(), "released content", "released content"])
+
 
 if __name__ == "__main__":
     unittest.main()

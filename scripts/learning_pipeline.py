@@ -844,9 +844,13 @@ def verify_unrelated_issue(issue: dict[str, Any], record: dict[str, Any], candid
         refs = issue.get(field)
         if not isinstance(refs, list) or (field == "targets" and not refs):
             raise ValueError("An unrelated finding needs explicit, well-formed source and target references.")
+        allowed_fields = [frozenset({"path", "sha256"})]
+        if field == "sources":
+            allowed_fields.append(frozenset({"path", "sha256", "note_id"}))
         seen = set()
         for ref in refs:
-            if (not isinstance(ref, dict) or set(ref) != {"path", "sha256"}
+            if (not isinstance(ref, dict) or frozenset(ref) not in allowed_fields
+                    or ("note_id" in ref and (not isinstance(ref["note_id"], str) or not clean(ref["note_id"])))
                     or not isinstance(ref.get("path"), str) or not Path(ref["path"]).is_absolute()
                     or not isinstance(ref.get("sha256"), str)
                     or not re.fullmatch(r"[a-f0-9]{64}", ref["sha256"])):
@@ -1180,6 +1184,28 @@ def current_parser_snapshot_refs(refs: list[dict[str, Any]]) -> bool:
     return all(_secure_scoped_ref(ref) for ref in refs)
 
 
+def cohort_target_refs(issue: dict[str, Any]) -> list[dict[str, str]]:
+    """Verify a retired pair against its exact historical preimages."""
+    targets = issue["targets"]
+    retired = issue.get("retired_target")
+    if retired is None:
+        return targets
+    original, archive, peer_archive = retired["path"], retired["archive"], retired["peer_archive"]
+    matching = [target for target in targets if target["path"] == original]
+    peers = [target for target in targets if target["path"] != original]
+    if (issue["status"] != "resolved" or len(matching) != 1
+            or len(peers) != 1 or peer_archive["sha256"] != peers[0]["sha256"]
+            or archive["sha256"] != matching[0]["sha256"]
+            or archive["path"] == peer_archive["path"]
+            or not Path(original).is_absolute()):
+        raise ValueError("Invalid retired cohort member.")
+    try:
+        Path(original).lstat()
+    except FileNotFoundError:
+        return [archive, peer_archive]
+    raise ValueError("Retired cohort member is present again; rerun the full audit.")
+
+
 def _current_cohort(issue: dict[str, Any], cache: dict, scoped: bool = False) -> bool:
     """Verify one cohort in a bounded worker; share source reads across cohorts."""
     if not COHORT_FIELDS.intersection(issue):
@@ -1193,17 +1219,17 @@ def _current_cohort(issue: dict[str, Any], cache: dict, scoped: bool = False) ->
         return False
     if issue.get("coverage_incomplete"):
         return False
-    for target in issue["targets"]:
-        key = ("target", target.get("path"), target.get("sha256"))
-        if key not in cache:
-            cache[key] = (_secure_scoped_ref(target) if scoped
-                          else _bounded_file_matches(target.get("path"), target.get("sha256")))
-        if not cache[key]:
-            return False
     ref = issue.get("latest_audit", {})
     if not isinstance(ref, dict):
         return False
     try:
+        for target in cohort_target_refs(issue):
+            key = ("target", target.get("path"), target.get("sha256"))
+            if key not in cache:
+                cache[key] = (_secure_scoped_ref(target) if scoped
+                              else _bounded_file_matches(target.get("path"), target.get("sha256")))
+            if not cache[key]:
+                return False
         key = ("report", ref["path"], ref["sha256"])
         if key not in cache:
             raw = read_regular_file_nofollow(Path(ref["path"]), 16 * 1024 * 1024)
@@ -1223,7 +1249,7 @@ def _current_cohort(issue: dict[str, Any], cache: dict, scoped: bool = False) ->
                   if len(group) == 2 and {item["path"] for item in group} == paths
                   and exact_issue_id(group) not in excluded]
         return fingerprint(cohort_members(groups)) == issue["member_hash"]
-    except (OSError, KeyError, TypeError, ValueError):
+    except (OSError, AttributeError, KeyError, TypeError, ValueError):
         return False
 
 
@@ -1232,14 +1258,16 @@ def _cohorts_current_in_worker(issues: list[dict[str, Any]]) -> bool:
     if not all(_current_cohort(issue, cache) for issue in issues):
         return False
     # A shared file may have changed while other cohorts were being checked.
-    return all(_bounded_file_matches(key[1], key[2]) for key in cache)
+    return (all(_bounded_file_matches(key[1], key[2]) for key in cache)
+            and all(_current_cohort(issue, cache) for issue in issues))
 
 
 def _scoped_cohorts_current_in_worker(issues: list[dict[str, Any]]) -> bool:
     cache: dict = {}
     if not all(_current_cohort(issue, cache, scoped=True) for issue in issues):
         return False
-    return all(_secure_scoped_ref({"path": key[1], "sha256": key[2]}) for key in cache)
+    return (all(_secure_scoped_ref({"path": key[1], "sha256": key[2]}) for key in cache)
+            and all(_current_cohort(issue, cache, scoped=True) for issue in issues))
 
 
 def current_cohorts(issues: list[dict[str, Any]], timeout: float = 8) -> bool:
@@ -2257,12 +2285,14 @@ class Pipeline:
                             "resolution": old.get("resolution", ""), "evidence": old.get("evidence", [])})
                         old.update(status="investigate", resolution="", evidence=[str(report)])
                     old["last_seen"] = record["created_at"]
+                    old["removal_audit"] = report_ref
                 else:
                     state["issues"][issue_id] = {
                         "id": issue_id, "kind": "operational", "status": "investigate",
                         "title": "Instruction audit coverage disappeared",
                         "description": "A previously audited instruction is missing or outside current audit roots; reconcile the removal separately.",
-                        "removed_path": removed, "targets": [], "sources": [], "options": [],
+                        "removed_path": removed, "removal_audit": report_ref,
+                        "targets": [], "sources": [], "options": [],
                         "question": "", "evidence": [str(report)], "resolution": "",
                         "discovered_run": run_id, "last_seen": record["created_at"],
                     }
@@ -2348,9 +2378,12 @@ class Pipeline:
                             or old["targets"] != targets
                             or old.get("member_hash") != member_hash
                             or not old.get("latest_audit")
-                            or old.get("excluded_member_ids", []) != excluded):
+                            or old.get("excluded_member_ids", []) != excluded
+                            or old.get("retired_target")):
                         old.setdefault("previous_targets", old["targets"])
                         old["revalidation_required"] = True
+                    if retired := old.pop("retired_target", None):
+                        old.setdefault("retired_target_history", []).append(retired)
                     old.update(targets=targets, description=description, member_hash=member_hash,
                                cohort_version=1, excluded_member_ids=excluded, latest_audit=report_ref,
                                coverage_incomplete=False, last_seen=record["created_at"])
@@ -2367,7 +2400,12 @@ class Pipeline:
                     "last_seen": record["created_at"], "resolution": "",
                 }
             for issue in state["issues"].values():
-                refs = issue.get("targets", []) + (issue.get("sources", []) if issue["status"] in OPEN else [])
+                try:
+                    targets = cohort_target_refs(issue) if issue.get("retired_target") else issue.get("targets", [])
+                except (OSError, KeyError, TypeError, ValueError):
+                    issue["revalidation_required"] = True
+                    continue
+                refs = targets + (issue.get("sources", []) if issue["status"] in OPEN else [])
                 if (issue["kind"] == "audit" or issue["status"] in OPEN) and any(not current(ref) for ref in refs):
                     issue["revalidation_required"] = True
             if affected:
@@ -2416,11 +2454,17 @@ class Pipeline:
         post_release_requested = "post_release" in issue
         if "post_release_binding" in issue or "publication_proof" in issue:
             raise ValueError("Post-release evidence binding is generated by the pipeline.")
+        if "removal_audit" in issue or "retired_target_history" in issue:
+            raise ValueError("Removal and retirement audit history is generated by the pipeline.")
         requested_parser_review = issue.get("parser_reviewed_version")
         with self.lock():
             loaded = self.load()["issues"]
             previous = loaded.get(issue["id"], {})
             parser_ledger = loaded.get(f"audit-parser-v{requested_parser_review}-reconciliation", {}) if requested_parser_review is not None else {}
+        retirement_requested = "retired_target" in issue
+        if retirement_requested and (previous.get("retired_target") is not None
+                                     or "member_hash" not in previous or previous.get("status") == "needs-user"):
+            raise ValueError("Only a current recorded cohort can retire a member.")
         if issue["id"].startswith("audit-parser-v") and any(
                 key in issue and issue[key] != previous.get(key)
                 for key in ("affected_issue_ids", "affected_target_paths", "parser_version", "parser_reconciliation_report")):
@@ -2432,9 +2476,11 @@ class Pipeline:
                    for key in ("targets", "member_hash", "latest_audit", "excluded_member_ids",
                                "cohort_version", "coverage_incomplete")):
                 raise ValueError("Only a new audit can change cohort discovery evidence.")
-            if not current_cohort(previous):
+            if not retirement_requested and not current_cohort(previous):
                 raise ValueError("Cohort audit or membership changed or is unavailable; retry or rerun the audit.")
         issue = {**previous, **issue}
+        if retirement_requested:
+            self.verify_cohort_retirement(issue, loaded)
         if (previous.get("post_release") and previous.get("status") not in OPEN
                 and issue.get("status") in OPEN and not post_release_requested):
             issue["post_release_binding"] = None
@@ -2533,7 +2579,7 @@ class Pipeline:
             if not isinstance(issue.get(key), str) or not clean(issue[key]):
                 raise ValueError(f"Issue needs {key}.")
         for key in ("targets", "sources"):
-            refs = issue.get(key, [])
+            refs = cohort_target_refs(issue) if key == "targets" and issue.get("retired_target") else issue.get(key, [])
             if not isinstance(refs, list) or any(not isinstance(ref, dict) or not current(ref) for ref in refs):
                 raise ValueError("Issue references must match current file hashes.")
         options = issue.get("options", [])
@@ -2642,7 +2688,9 @@ class Pipeline:
                         or not current_parser_reconciliation(parser_report, affected, bound_paths, requested_parser_review,
                                                              issue.get("targets", []))):
                     raise ValueError("Parser reconciliation changed during assessment; retry.")
-            if not current_cohort(previous):
+            if retirement_requested:
+                self.verify_cohort_retirement(issue, state["issues"])
+            elif not current_cohort(previous):
                 raise ValueError("Cohort audit or membership changed or is unavailable during assessment; retry.")
             if issue["id"].startswith("audit-parser-v") and issue["status"] in {"resolved", "justified"}:
                 version = previous.get("parser_version")
@@ -2688,6 +2736,37 @@ class Pipeline:
             state["issues"][issue["id"]] = merged
             self.save(state)
             return merged
+
+    def verify_cohort_retirement(self, issue: dict, issues: dict) -> None:
+        """Require a reconciled removal and intact archived discovery evidence."""
+        retired = issue.get("retired_target")
+        if (not isinstance(retired, dict) or set(retired) != {"path", "archive", "peer_archive"}
+                or not isinstance(retired["path"], str)):
+            raise ValueError("Retirement requires an original path and two archived snapshots.")
+        removed = retired["path"]
+        removal = issues.get("audit-removal-" + fingerprint(removed)[:24], {})
+        if (removal.get("removed_path") != removed or removal.get("status") not in {"resolved", "justified"}
+                or removal.get("revalidation_required")):
+            raise ValueError("Reconcile the audited instruction removal before retiring the cohort member.")
+        discovery = removal.get("removal_audit", {})
+        if discovery not in removal.get("resolution_evidence", []):
+            raise ValueError("Retirement requires the registered removal audit in the reconciliation evidence.")
+        valid, _, digest = check_sealed_file(self.root_lexical, removal["id"], "report-snapshot", discovery, 8)
+        if not valid or digest != discovery["sha256"]:
+            raise ValueError("Retirement removal audit evidence changed.")
+        raw = read_regular_file_nofollow(Path(discovery["path"]), 16 * 1024 * 1024)
+        audit = json.loads(raw)["audit"]
+        if (hashlib.sha256(raw).hexdigest() != digest or audit.get("comparison_scope") != "full"
+                or removed not in audit.get("removed_files", [])):
+            raise ValueError("Retirement requires a full audit confirming the removed instruction.")
+        for archive in (retired["archive"], retired["peer_archive"]):
+            if (not isinstance(archive, dict) or set(archive) != {"path", "sha256"}
+                    or not isinstance(archive["path"], str) or not Path(archive["path"]).is_absolute()):
+                raise ValueError("Retirement requires absolute archived snapshots.")
+            if not check_sealed_file(self.root_lexical, issue["id"], "report-snapshot", archive, 8)[0]:
+                raise ValueError("Retirement requires an absent original and exact archived cohort evidence.")
+        if not current_cohort(issue):
+            raise ValueError("Retirement requires an absent original and exact archived cohort evidence.")
 
     def reconcile_run(self, run_id: str, followup_ids: list[str], report_path: str) -> dict[str, Any]:
         """Record recovery separately from a run's immutable terminal outcome."""
@@ -2983,7 +3062,8 @@ class Pipeline:
                 elif classification == "block":
                     blocking.append(key)
                 elif classification == "defer":
-                    refs = issue.get("sources", []) + issue.get("targets", [])
+                    targets = cohort_target_refs(issue) if issue.get("retired_target") else issue.get("targets", [])
+                    refs = issue.get("sources", []) + targets
                     if not refs or any(not isinstance(ref, dict) or not _secure_scoped_ref(ref) for ref in refs):
                         raise ValueError("A deferred issue needs current source and target evidence.")
                     deferred_references.extend(refs)
@@ -3124,7 +3204,7 @@ class Pipeline:
             seconds = max(0, deadline - time.monotonic())
             if not item["kinds"].intersection({"resolution", "removal-resolution", "report", "post-release-report"}):
                 return check_external_ref(item["ref"], seconds)
-            return check_sealed_file(self.root, "release", "resolution-evidence", item["ref"], seconds)[0]
+            return check_sealed_file(self.root_lexical, "release", "resolution-evidence", item["ref"], seconds)[0]
         executor = ThreadPoolExecutor(max_workers=8)
         try:
             futures = {executor.submit(check, item): item for item in references.values()}

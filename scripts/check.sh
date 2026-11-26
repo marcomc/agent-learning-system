@@ -20,5 +20,15 @@ if [[ ${#markdown_files[@]} -gt 0 ]]; then
 fi
 shellcheck --enable=all "${REPO_DIR}/install.sh" "${REPO_DIR}"/scripts/*.sh
 python3 -m compileall -q "${REPO_DIR}/scripts" "${REPO_DIR}/tests"
-python3 -m unittest discover -s "${REPO_DIR}/tests"
+# Runtime overrides take precedence even over explicitly supplied fixture configs.
+python3 -c '
+import os
+import sys
+
+test_env = {
+    key: value for key, value in os.environ.items()
+    if not key.startswith(("AGENT_LEARNING_", "CODEX_"))
+}
+os.execve(sys.executable, [sys.executable, "-m", "unittest", "discover", "-s", sys.argv[1]], test_env)
+' "${REPO_DIR}/tests"
 exit 0

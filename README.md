@@ -649,6 +649,9 @@ GitHub Actions. It uses `$HOME/.markdownlint.json` when available, otherwise the
 versioned config; `MARKDOWNLINT_CONFIG` selects a config explicitly. CI uses
 Node.js 22, Python 3.13, Markdownlint CLI 0.50.0 and ShellCheck on Ubuntu 24.04.
 Local execution needs those tools on `PATH` and a POSIX Python runtime.
+The validation suite discards inherited `AGENT_LEARNING_*` and `CODEX_*`
+variables before running tests so fixture configuration cannot be redirected
+to a live store or scheduled chat.
 
 Run:
 

@@ -6,6 +6,12 @@ The project follows semantic versioning.
 
 ## Unreleased
 
+## [2.0.2] - 2026-11-26
+
+### Fixed
+
+- Isolate validation from exported runtime settings so installer tests use fixtures even when the shell is configured for a live learning store. (validation-isolation)
+
 ## [2.0.1] - 2026-11-17
 
 ### Changed
